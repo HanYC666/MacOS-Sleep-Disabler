@@ -1,0 +1,16 @@
+# Xcode clutter
+.DS_Store
+build/
+DerivedData/
+
+# Commit personal settings only if you explicitly want to share shared schemes
+*.xcuserdata
+*.xcuserdatad
+      
+# Swift Package Manager / CocoaPods dependencies (let the user fetch them)
+.swiftpm/xcode/package.xcworkspace/contents.xcworkspacedata
+.build/
+Pods/
+
+# Secrets (if you use an environment file for API keys)
+.env
