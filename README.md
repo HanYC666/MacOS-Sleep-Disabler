@@ -2,6 +2,8 @@
 
 A ultra-lightweight, native macOS utility built in SwiftUI that prevents your Mac from sleeping or turning off its display. It provides a seamless transition between standard Window Mode and a streamlined Menu Bar app, putting total control over your system's power management right at your fingertips.
 
+This is extremely useful when running unsupervised training or agentic workflows!
+
 ---
 
 ## ✨ Features
