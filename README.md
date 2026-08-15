@@ -98,3 +98,7 @@ All contents of this project come with **absolutely no warranty**.
 ### ⚠️ Condition of Use
 
 You are free to distribute, remix, and adapt this software, but **you must credit the original author (me HanYC666)** in your repository, documentation, or application credits.
+
+### AI Use
+
+GPT-OSS from Antigravity-IDE has been used in writing the README.md and formatting code.
