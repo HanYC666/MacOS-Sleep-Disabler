@@ -1,106 +1,101 @@
-# 🌙 Sleep Disabler for macOS
+# Sleep Disabler
 
-A ultra-lightweight, native macOS utility built in SwiftUI that prevents your Mac from sleeping or turning off its display. It provides a seamless transition between standard Window Mode and a streamlined Menu Bar app, putting total control over your system's power management right at your fingertips.
+The most lightweight macOS app that lets you quickly stop your Mac from sleeping or turning off its display.
 
-This is extremely useful when running unsupervised training or agentic workflows!
+It is written in SwiftUI and can run either as a normal window or as a menu bar app. It is useful for long-running downloads, scripts, builds, or agentic tasks where the Mac needs to stay awake.
 
----
+## What it does
 
-## ✨ Features
+- Turn sleep and display sleep on or off.
+- Run from a regular window or from the menu bar.
+- Remember your selected mode after restarting the app.
+- Optionally launch when you log in.
+- Show the current state with a menu bar icon.
+- Check the power settings regularly so the displayed state stays up to date.
 
-* **Anti-Notch First Launch:** By default, the app launches in **Window Mode** on its very first run. This ensures the app is immediately visible and prevents the menu bar icon from getting trapped behind the camera notch on modern MacBook Pro models.
-* **Persistent Memory:** Seamlessly switch between Window Mode and Menu Bar Mode. The app remembers your exact layout and sleep preferences across restarts.
-* **Launch at Login:** Option to automatically start the utility when you boot up your Mac.
-* **Native Power Management:** Safely hooks directly into macOS's native `pmset` architecture.
+## Requirements
 
----
+- macOS 13.5 or newer
+- Apple Silicone Mac (M1 chip or newer)
+- Xcode, if building from source
 
-## 📊 Performance & Footprint
+## Install
 
-This application is engineered for maximum efficiency. It runs silently in the background with practically zero impact on system resources.
+Download the latest `Sleep Disabler.zip` from the Releases page, then extract it and move it to your Applications folder.
 
-| Metric | Resource Usage |
-| --- | --- |
-| 💾 **Disk Space** | 394 KB (Total compiled app size) |
-| 🧠 **Memory (RAM)** | ~19 MB when idle |
-| ⚡ **CPU Usage** | 0% when idle |
+On the first launch, the app opens in Window Mode. This makes it easier to find, especially on MacBook Pro where a menu bar icon could be hidden near the camera notch.
 
----
+## Permissions
 
-## 🚀 Setup Guide (For MacOS 13.5+)
+Sleep Disabler uses macOS's `pmset` command to change power settings. Running `pmset` requires administrator permission.
 
-Setting up the app on a fresh installation of macOS is incredibly straightforward. Follow these steps to get up and running:
-
-### Step 1: Install the Application
-
-1. Download the compiled `Sleep Disabler.app` from the Releases page (or build it directly from this source code using Xcode).
-2. Drag and drop `Sleep Disabler.app` into your **Applications** folder.
-3. Open the app. Because it defaults to **Window Mode**, it will appear cleanly in the center of your screen.
-
-### Step 2: Configure System Permissions (`pmset`)
-
-To toggle system sleep states without requiring you to type your administrator password every single time, the app needs permission to run the macOS power management tool (`/usr/bin/pmset`).
-
-#### Method A: Automatic Setup (Recommended)
-
-When you first click "Disable Sleep", the app will detect if it lacks permissions and prompt you with an alert asking to install the configuration. Clicking **Enable** will automatically authorize it.
-
-#### Method B: Manual Setup via Terminal (Using Nano)
-
-If you prefer to configure the security rules manually, or if your system environment restricts automatic deployment, you can use the terminal.
-
-> ⚠️ **Important Note:** Running standard `sudo visudo` opens the configuration file inside **Vim**, which can be highly confusing to exit if you aren't familiar with it. Follow the command below to force macOS to open it in **Nano** instead:
-
-1. Open your terminal app and paste the following command to edit the security file safely using the Nano text editor:
-
-```bash
-sudo EDITOR=nano visudo /etc/sudoers.d/sleep_disabler
-
-```
-
-2. Enter your Mac's login password when prompted.
-3. A interactive text editor will appear. Copy and paste the exact line below into the last line (assuming your user account is an admin account, if not replace '%admin' with your username):
+The app checks for a password-free permission rule when it starts. If the rule is missing, it asks whether you want to install the rule. Choosing **Enable** creates `/etc/sudoers.d/sleep_disabler` with:
 
 ```text
 %admin ALL=(ALL) NOPASSWD: /usr/bin/pmset
-
 ```
 
-4. Save and exit **Nano**:
-* Press `Control + O` then press `Enter` to write the file.
-* Press `Control + X` to exit the editor.
+This lets the app run the required `pmset` commands without asking for your password every time. If you do not want the app to install the rule automatically, choose **Cancel** and set it up manually as below.
 
+### Manual setup
 
-5. Secure the file permissions by running this final command:
+Open Terminal and run:
+
+```bash
+sudo EDITOR=nano visudo -f /etc/sudoers.d/sleep_disabler
+```
+
+Add this line:
+
+```text
+%admin ALL=(ALL) NOPASSWD: /usr/bin/pmset
+```
+
+Save the file in Nano with `Control + O`, press `Enter`, then exit with `Control + X`.
+
+Finally, set the file permissions:
 
 ```bash
 sudo chmod 440 /etc/sudoers.d/sleep_disabler
-
 ```
 
-Your app is now fully configured and ready to roll!
+Only add a `sudoers` rule if you understand what it does. If you want to remove it, delete `/etc/sudoers.d/sleep_disabler` using a method you are comfortable with that has administrator access, e.g. the rm command with sudo.
 
----
+## Building from source
 
-## 🛠️ How It Works Under the Hood
+1. Open `Sleep Disabler.xcodeproj` in Xcode.
+2. Select the **Sleep Disabler** target.
+3. Choose your Mac as the run destination.
+4. Build and run with `Command + R`.
 
-The application dynamically coordinates your preferences through two core macOS systems:
+The deployment target is macOS 13.5 by project default.
 
-* `UserDefaults`: Saves your chosen interface configuration (Window vs. Menu Bar) locally in `~/Library/Preferences/`. This is completely external to the application binary, meaning you can share the `.app` bundle with a friend, and it will still boot freshly in Window Mode on *their* machine without bringing your custom preferences along.
-* `pmset`: Executes low-overhead commands to toggle `disablesleep`, `sleep`, and `displaysleep` modes instantly.
+## How it works
 
----
+When sleep is disabled, the app runs these commands through `pmset`:
 
-## 📄 License & Open Source Terms
+```bash
+sudo pmset -a disablesleep 1
+sudo pmset -a sleep 0
+sudo pmset -a displaysleep 0
+```
 
-This project is completely **open-source** and free to use. You are welcome to modify the code, build on top of it, fork the repository, or integrate it into your own custom projects.
+When sleep is enabled again, it restores the app's default values:
+
+```bash
+sudo pmset -a disablesleep 0
+sudo pmset -a sleep 10
+sudo pmset -a displaysleep 10
+```
+
+The selected interface mode is stored in `UserDefaults`, so the app can remember whether it should start in Window Mode or Menu Bar Mode.
+
+## License
+
+This project is completely open-source and free to use. You are welcome to modify the code, build on top of it, fork the repository, or integrate it into your own custom projects.
 
 All contents of this project come with **absolutely no warranty**.
 
-### ⚠️ Condition of Use
+## AI disclosure
 
-You are free to distribute, remix, and adapt this software, but **you must credit the original author (me HanYC666)** in your repository, documentation, or application credits.
-
-### AI Use
-
-GPT-OSS from Antigravity-IDE has been used in writing the README.md and formatting code.
+GPT-OSS in Antigravity-IDE was used to help format parts of the code.
