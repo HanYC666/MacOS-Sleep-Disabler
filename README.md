@@ -12,12 +12,15 @@ It is written in SwiftUI and can run either as a normal window or as a menu bar 
 - Optionally launch when you log in.
 - Show the current state with a menu bar icon.
 - Check the power settings regularly so the displayed state stays up to date.
+- **Dynamic State Saving**: Remembers exactly what your Mac's sleep settings were before disabling sleep, and perfectly restores them when re-enabled.
+- **Battery Failsafe**: Let's you set a custom battery percentage (like 5%). If the battery drops below this while sleep is disabled, the app saves your Mac by forcing it to sleep and dropping a notification window.
+- **Lid-Closed Dimmer**: When sleep is disabled, you can close your MacBook lid to drop the screen brightness completely to 0 (so it doesn't glow or waste power) while still keeping the Mac wide awake. Opening the lid brings your brightness right back!
 
 ## Requirements
 
 - macOS 13.5 or newer
-- Apple Silicone Mac (M1 chip or newer)
-- Xcode, if building from source
+- Apple Silicon Mac (M1 chip or newer)
+- Xcode/Xcode Command Line Tools (for building from source)
 
 ## Install
 
@@ -68,11 +71,13 @@ Only add a `sudoers` rule if you understand what it does. If you want to remove 
 3. Choose your Mac as the run destination.
 4. Build and run with `Command + R`.
 
+*(If you don't have the full Xcode app installed and want to build directly from Terminal using Command Line Tools, check out [compile.md](compile.md) for the full guide!)*
+
 The deployment target is macOS 13.5 by project default.
 
 ## How it works
 
-When sleep is disabled, the app runs these commands through `pmset`:
+When sleep is disabled, the app first runs `pmset -g custom` behind the scenes. It grabs your exact settings for both Battery and AC power and saves them to `UserDefaults`. Then it runs these commands through `pmset` to keep the Mac awake:
 
 ```bash
 sudo pmset -a disablesleep 1
@@ -80,15 +85,17 @@ sudo pmset -a sleep 0
 sudo pmset -a displaysleep 0
 ```
 
-When sleep is enabled again, it restores the app's default values:
+When sleep is enabled again, instead of resetting to a hardcoded default, it restores your exact original values perfectly using your saved states:
 
 ```bash
 sudo pmset -a disablesleep 0
-sudo pmset -a sleep 10
-sudo pmset -a displaysleep 10
+sudo pmset -b sleep <saved_battery_sleep>
+sudo pmset -b displaysleep <saved_battery_displaysleep>
+sudo pmset -c sleep <saved_ac_sleep>
+sudo pmset -c displaysleep <saved_ac_displaysleep>
 ```
 
-The selected interface mode is stored in `UserDefaults`, so the app can remember whether it should start in Window Mode or Menu Bar Mode.
+For the **Lid-Closed Dimmer**, the app polls your MacBook's `AppleClamshellState` using `ioreg`. When it detects the lid is closed, it hooks directly into macOS's private `DisplayServices` framework (which is why it needs Apple Silicon) to drop the brightness exactly to 0 without actually triggering a system sleep event! 
 
 ## License
 
