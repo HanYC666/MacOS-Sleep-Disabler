@@ -4,6 +4,8 @@ The most lightweight macOS app that lets you quickly stop your Mac from sleeping
 
 It is written in SwiftUI and can run either as a normal window or as a menu bar app. It is useful for long-running downloads, scripts, builds, or agentic tasks where the Mac needs to stay awake.
 
+Ram usage: 27.6 MB with all functions turned on.
+
 ## What it does
 
 - Turn sleep and display sleep on or off.
@@ -73,7 +75,7 @@ Only add a `sudoers` rule if you understand what it does. If you want to remove 
 
 *(If you don't have the full Xcode app installed and want to build directly from Terminal using Command Line Tools, check out [compile.md](compile.md) for the full guide!)*
 
-The deployment target is macOS 13.5 by project default.
+The deployment target is macOS 13.5+ by project default.
 
 ## How it works
 
