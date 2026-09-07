@@ -17,6 +17,7 @@ Ram usage: 27.6 MB with all functions turned on.
 - **Dynamic State Saving**: Remembers exactly what your Mac's sleep settings were before disabling sleep, and perfectly restores them when re-enabled.
 - **Battery Failsafe**: Let's you set a custom battery percentage (like 5%). If the battery drops below this while sleep is disabled, the app saves your Mac by forcing it to sleep and dropping a notification window.
 - **Lid-Closed Dimmer**: When sleep is disabled, you can close your MacBook lid to drop the screen brightness completely to 0 (so it doesn't glow or waste power) while still keeping the Mac wide awake. Opening the lid brings your brightness right back!
+- **Sleep Scheduler**: Set a days, hours, and minutes countdown to put your Mac to sleep. The last duration and its safety options are saved, and menu-bar mode provides a quick start action plus a live remaining-time display.
 
 ## Requirements
 
@@ -98,6 +99,8 @@ sudo pmset -c displaysleep <saved_ac_displaysleep>
 ```
 
 For the **Lid-Closed Dimmer**, the app polls your MacBook's `AppleClamshellState` using `ioreg`. When it detects the lid is closed, it hooks directly into macOS's private `DisplayServices` framework (which is why it needs Apple Silicon) to drop the brightness exactly to 0 without actually triggering a system sleep event! 
+
+The **Sleep Scheduler** uses the selected days, hours, and minutes as a countdown and then runs `pmset sleepnow`. Its saved values are restored at launch, so the menu-bar quick start always uses the last configured schedule. While a schedule is active, the menu displays the live remaining time. The optional closed-lid condition prevents starting while the lid is open and cancels the schedule if the lid opens. The optional sleep-disabled condition only permits a schedule while Sleep Disabler is active, and cancels it when normal sleep is restored.
 
 ## License
 

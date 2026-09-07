@@ -76,6 +76,46 @@ final class AppState: ObservableObject {
         didSet { UserDefaults.standard.set(lidDimmerEnabled, forKey: "lidDimmerEnabled") }
     }
 
+    @Published var sleepTimerDays = 0 {
+        didSet {
+            UserDefaults.standard.set(sleepTimerDays, forKey: "sleepTimerDays")
+            refreshMenuBar()
+        }
+    }
+
+    @Published var sleepTimerHours = 0 {
+        didSet {
+            UserDefaults.standard.set(sleepTimerHours, forKey: "sleepTimerHours")
+            refreshMenuBar()
+        }
+    }
+
+    @Published var sleepTimerMinutes = 30 {
+        didSet {
+            UserDefaults.standard.set(sleepTimerMinutes, forKey: "sleepTimerMinutes")
+            refreshMenuBar()
+        }
+    }
+
+    @Published var sleepTimerLidClosedOnly = false {
+        didSet { UserDefaults.standard.set(sleepTimerLidClosedOnly, forKey: "sleepTimerLidClosedOnly") }
+    }
+
+    @Published var sleepTimerSleepDisabledOnly = false {
+        didSet {
+            UserDefaults.standard.set(sleepTimerSleepDisabledOnly, forKey: "sleepTimerSleepDisabledOnly")
+            if sleepTimerSleepDisabledOnly && sleepTimerRunning && !isFullySleepDisabled {
+                sleepTimerRunning = false
+            }
+        }
+    }
+
+    @Published var sleepTimerRunning = false {
+        didSet { sleepTimerRunning ? startSleepTimer() : stopSleepTimer() }
+    }
+
+    @Published private(set) var sleepTimerRemaining: TimeInterval = 0
+
     private var statusItem: NSStatusItem?
     private var refreshTimer: Timer?
     private var isTogglingSleep = false
@@ -84,6 +124,27 @@ final class AppState: ObservableObject {
     private var originalBrightness: Float? = nil
     private var isCurrentlyDimmed = false
     private var lidCheckTimer: Timer?
+    private var sleepTimer: Timer?
+    private var sleepTimerEndDate: Date?
+    private weak var sleepSchedulerRemainingMenuItem: NSMenuItem?
+
+    var hasSleepTimerDuration: Bool { sleepTimerDuration > 0 }
+
+    var sleepTimerRemainingText: String {
+        let seconds = max(0, Int(sleepTimerRemaining.rounded(.up)))
+        let days = seconds / 86_400
+        let hours = (seconds % 86_400) / 3_600
+        let minutes = (seconds % 3_600) / 60
+        let remainingSeconds = seconds % 60
+        if days > 0 { return "\(days)d \(hours)h \(minutes)m" }
+        if hours > 0 { return "\(hours)h \(minutes)m" }
+        if minutes > 0 { return "\(minutes)m \(remainingSeconds)s" }
+        return "\(remainingSeconds)s"
+    }
+
+    private var sleepTimerDuration: TimeInterval {
+        TimeInterval(sleepTimerDays * 86_400 + sleepTimerHours * 3_600 + sleepTimerMinutes * 60)
+    }
 
     // Notification Window
     private var notificationWindow: NSWindow?
@@ -94,6 +155,12 @@ final class AppState: ObservableObject {
         let threshold = UserDefaults.standard.integer(forKey: "failsafeThreshold")
         failsafeThreshold = threshold > 0 ? threshold : 20
         lidDimmerEnabled = UserDefaults.standard.object(forKey: "lidDimmerEnabled") as? Bool ?? false
+        sleepTimerDays = min(max(0, UserDefaults.standard.integer(forKey: "sleepTimerDays")), 365)
+        sleepTimerHours = min(max(0, UserDefaults.standard.integer(forKey: "sleepTimerHours")), 23)
+        let savedMinutes = UserDefaults.standard.object(forKey: "sleepTimerMinutes") as? Int
+        sleepTimerMinutes = min(max(0, savedMinutes ?? 30), 59)
+        sleepTimerLidClosedOnly = UserDefaults.standard.object(forKey: "sleepTimerLidClosedOnly") as? Bool ?? false
+        sleepTimerSleepDisabledOnly = UserDefaults.standard.object(forKey: "sleepTimerSleepDisabledOnly") as? Bool ?? false
 
         updateActivationPolicy()
         refreshAll()
@@ -110,7 +177,7 @@ final class AppState: ObservableObject {
     }
 
     func configureInitialWindow(_ window: NSWindow) {
-        window.setContentSize(NSSize(width: 440, height: 480))
+        window.setContentSize(NSSize(width: 440, height: 620))
         if menuBarMode {
             window.orderOut(nil)
         }
@@ -202,6 +269,27 @@ final class AppState: ObservableObject {
         menu.addItem(dimmer)
         menu.addItem(.separator())
 
+        if sleepTimerRunning {
+            let remaining = NSMenuItem(
+                title: "Sleep Scheduler: \(sleepTimerRemainingText) remaining",
+                action: nil,
+                keyEquivalent: ""
+            )
+            remaining.isEnabled = false
+            menu.addItem(remaining)
+            sleepSchedulerRemainingMenuItem = remaining
+        }
+
+        let timer = NSMenuItem(
+            title: sleepTimerRunning ? "Stop Sleep Scheduler" : "Start Last Used Sleep Scheduler (\(savedSleepTimerDescription))",
+            action: #selector(toggleSleepTimerMenu),
+            keyEquivalent: ""
+        )
+        timer.target = self
+        timer.isEnabled = sleepTimerRunning || hasSleepTimerDuration
+        menu.addItem(timer)
+        menu.addItem(.separator())
+
         let show = NSMenuItem(
             title: "Show Window",
             action: #selector(showWindowMenu),
@@ -268,6 +356,7 @@ final class AppState: ObservableObject {
         lidDimmerEnabled.toggle()
         refreshMenuBar()
     }
+    @objc func toggleSleepTimerMenu() { sleepTimerRunning.toggle() }
     @objc func quitMenu() { NSApp.terminate(nil) }
 
     // MARK: - SLEEP STATE MANAGEMENT
@@ -292,6 +381,9 @@ final class AppState: ObservableObject {
             DispatchQueue.main.async {
                 guard self.isTogglingSleep == false else { return }
                 self.isFullySleepDisabled = isDisabled
+                if self.sleepTimerSleepDisabledOnly && self.sleepTimerRunning && !isDisabled {
+                    self.sleepTimerRunning = false
+                }
                 self.updateMenuBarIcon()
                 self.refreshMenuBar()
             }
@@ -358,6 +450,10 @@ final class AppState: ObservableObject {
         isTogglingSleep = true
         let enabling = !isFullySleepDisabled
 
+        if !enabling && sleepTimerSleepDisabledOnly && sleepTimerRunning {
+            sleepTimerRunning = false
+        }
+
         if enabling {
             saveCurrentPmsetValues()
             runCommand(["-a", "disablesleep", "1"])
@@ -416,19 +512,10 @@ final class AppState: ObservableObject {
     }
 
     func triggerFailsafe() {
-        if isCurrentlyDimmed { restoreBrightness() }
-        if isFullySleepDisabled { toggleSleep() }
-
         DispatchQueue.main.async {
             self.showNotificationWindow()
         }
-
-        DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) {
-            let p = Process()
-            p.executableURL = URL(fileURLWithPath: "/usr/bin/pmset")
-            p.arguments = ["sleepnow"]
-            try? p.run()
-        }
+        forceMacToSleep()
     }
 
     func showNotificationWindow() {
@@ -454,11 +541,30 @@ final class AppState: ObservableObject {
 
     // MARK: - LID DIMMER
     func checkLidState() {
+        guard lidDimmerEnabled || (sleepTimerRunning && sleepTimerLidClosedOnly) else {
+            if isCurrentlyDimmed { restoreBrightness() }
+            return
+        }
+
+        let isClosed = isLidClosed()
+
+        if sleepTimerRunning && sleepTimerLidClosedOnly && !isClosed {
+            sleepTimerRunning = false
+        }
+
         guard lidDimmerEnabled, isFullySleepDisabled else {
             if isCurrentlyDimmed { restoreBrightness() }
             return
         }
 
+        if isClosed && !isCurrentlyDimmed {
+            dimBrightness()
+        } else if !isClosed && isCurrentlyDimmed {
+            restoreBrightness()
+        }
+    }
+
+    private func isLidClosed() -> Bool {
         let p = Process()
         p.executableURL = URL(fileURLWithPath: "/usr/sbin/ioreg")
         p.arguments = ["-r", "-k", "AppleClamshellState", "-d", "4"]
@@ -467,14 +573,7 @@ final class AppState: ObservableObject {
         try? p.run()
         p.waitUntilExit()
         let out = String(decoding: pipe.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
-
-        let isClosed = out.contains("\"AppleClamshellState\" = Yes")
-
-        if isClosed && !isCurrentlyDimmed {
-            dimBrightness()
-        } else if !isClosed && isCurrentlyDimmed {
-            restoreBrightness()
-        }
+        return out.contains("\"AppleClamshellState\" = Yes")
     }
 
     func dimBrightness() {
@@ -491,6 +590,71 @@ final class AppState: ObservableObject {
             _ = DisplayServicesSetBrightness(CGMainDisplayID(), orig)
         }
         isCurrentlyDimmed = false
+    }
+
+    // MARK: - SLEEP TIMER
+    func startSleepTimer() {
+        guard hasSleepTimerDuration else {
+            sleepTimerRunning = false
+            return
+        }
+        guard !sleepTimerLidClosedOnly || isLidClosed() else {
+            sleepTimerRunning = false
+            return
+        }
+        guard !sleepTimerSleepDisabledOnly || isFullySleepDisabled else {
+            sleepTimerRunning = false
+            return
+        }
+
+        stopSleepTimer()
+        sleepTimerEndDate = Date().addingTimeInterval(sleepTimerDuration)
+        updateSleepTimerRemaining()
+        let timer = Timer(timeInterval: 1, repeats: true) { [weak self] _ in
+            self?.updateSleepTimerRemaining()
+        }
+        RunLoop.main.add(timer, forMode: .common)
+        sleepTimer = timer
+        refreshMenuBar()
+    }
+
+    func stopSleepTimer() {
+        sleepTimer?.invalidate()
+        sleepTimer = nil
+        sleepTimerEndDate = nil
+        sleepTimerRemaining = 0
+        refreshMenuBar()
+    }
+
+    private func updateSleepTimerRemaining() {
+        guard let endDate = sleepTimerEndDate else { return }
+        let remaining = endDate.timeIntervalSinceNow
+        if remaining <= 0 {
+            sleepTimerRunning = false
+            forceMacToSleep()
+        } else {
+            sleepTimerRemaining = remaining
+            sleepSchedulerRemainingMenuItem?.title = "Sleep Scheduler: \(sleepTimerRemainingText) remaining"
+        }
+    }
+
+    private var savedSleepTimerDescription: String {
+        let components = [
+            sleepTimerDays > 0 ? "\(sleepTimerDays)d" : nil,
+            sleepTimerHours > 0 ? "\(sleepTimerHours)h" : nil,
+            sleepTimerMinutes > 0 ? "\(sleepTimerMinutes)m" : nil
+        ].compactMap { $0 }
+        return components.joined(separator: " ")
+    }
+
+    private func forceMacToSleep() {
+        if isCurrentlyDimmed { restoreBrightness() }
+        let needsRestore = isFullySleepDisabled
+        if needsRestore { toggleSleep() }
+
+        DispatchQueue.main.asyncAfter(deadline: .now() + (needsRestore ? 1.5 : 0)) {
+            self.runCommand(["sleepnow"])
+        }
     }
 
     // MARK: - LAUNCH AT LOGIN

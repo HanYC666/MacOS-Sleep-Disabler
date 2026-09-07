@@ -16,6 +16,7 @@ struct CustomStepper: NSViewRepresentable {
         stepper.maxValue = Double(range.upperBound)
         stepper.increment = 1
         stepper.autorepeat = true
+        stepper.isContinuous = true
         stepper.valueWraps = false
         stepper.target = context.coordinator
         stepper.action = #selector(Coordinator.valueChanged(_:))
@@ -91,6 +92,39 @@ struct MainView: View {
             Divider()
 
             VStack(alignment: .leading, spacing: 6) {
+                Toggle(isOn: $appState.sleepTimerRunning) {
+                    Text(appState.sleepTimerRunning ? "Sleep Scheduler Running" : "Sleep Scheduler")
+                        .fontWeight(.medium)
+                }
+                .toggleStyle(.switch)
+                .disabled(!appState.sleepTimerRunning && !appState.hasSleepTimerDuration)
+
+                Text(appState.sleepTimerRunning
+                     ? "Your Mac will sleep in \(appState.sleepTimerRemainingText)."
+                     : "Puts your Mac to sleep after the selected duration.")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+
+                HStack(spacing: 18) {
+                    timerValue("Days", value: $appState.sleepTimerDays, range: 0...365)
+                    timerValue("Hours", value: $appState.sleepTimerHours, range: 0...23)
+                    timerValue("Minutes", value: $appState.sleepTimerMinutes, range: 0...59)
+                }
+
+                Toggle("Only enable when lid is closed", isOn: $appState.sleepTimerLidClosedOnly)
+                    .font(.caption)
+                    .toggleStyle(.checkbox)
+
+                Toggle("Only enable when sleep is disabled", isOn: $appState.sleepTimerSleepDisabledOnly)
+                    .font(.caption)
+                    .toggleStyle(.checkbox)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+
+            Divider()
+
+            VStack(alignment: .leading, spacing: 6) {
                 Toggle(isOn: $appState.lidDimmerEnabled) {
                     Text("Lid-Closed Dimmer (When Disabled)")
                         .fontWeight(.medium)
@@ -126,7 +160,20 @@ struct MainView: View {
             Spacer()
         }
         .padding(20)
-        .frame(minWidth: 420, maxWidth: 460, minHeight: 460)
+        .frame(minWidth: 420, maxWidth: 460, minHeight: 600)
+    }
+
+    private func timerValue(_ title: String, value: Binding<Int>, range: ClosedRange<Int>) -> some View {
+        HStack(spacing: 4) {
+            Text("\(title):")
+                .frame(width: 54, alignment: .leading)
+            Text("\(value.wrappedValue)")
+                .monospacedDigit()
+                .frame(width: 28, alignment: .trailing)
+            CustomStepper(value: value, range: range)
+                .frame(width: 19, height: 24)
+        }
+        .frame(width: 109, alignment: .leading)
     }
 }
 
