@@ -6,10 +6,17 @@ set -euo pipefail
 # Application identity and a verified notarytool keychain profile. Otherwise it
 # produces a local-development-signed bundle (or an ad-hoc local bundle).
 
-project_path="Sleep Disabler.xcodeproj"
-scheme="Sleep Disabler"
 output_directory="${1:-build/native-archives}"
 notary_profile="${NOTARYTOOL_PROFILE:-}"
+sdk_path="$(xcrun --show-sdk-path)"
+module_cache_path="${output_directory}/.swift-module-cache"
+source_files=(
+  "Sleep Disabler/ContentView.swift"
+  "Sleep Disabler/FeatureServices.swift"
+  "Sleep Disabler/PrivilegeAndMenu.swift"
+  "Sleep Disabler/Sleep_DisablerApp.swift"
+  "Sleep Disabler/SystemServices.swift"
+)
 
 die() {
   print -u2 -- "error: $*"
@@ -33,7 +40,7 @@ release_mode="local"
 signing_identity="${local_identity}"
 
 if [[ -n "${developer_id_identity}" && -n "${notary_profile}" ]]; then
-  command -v xcrun >/dev/null || die "Xcode is required for notarytool."
+  command -v xcrun >/dev/null || die "Command Line Tools are required for notarytool."
   # This is a read-only credentials/service preflight. A configured profile is
   # not enough on its own: it must successfully authenticate with Apple.
   if xcrun notarytool history --keychain-profile "${notary_profile}" >/dev/null 2>&1; then
@@ -82,26 +89,26 @@ notarize_bundle() {
 
 archive_one() {
   local architecture="$1"
-  local archive_path="${output_directory}/Sleep-Disabler-${architecture}.xcarchive"
-  local archive_app="${archive_path}/Products/Applications/Sleep Disabler.app"
   local release_app="${output_directory}/Sleep-Disabler-${architecture}.app"
   local release_zip="${output_directory}/Sleep-Disabler-${architecture}.zip"
 
   [[ ! -e "${release_app}" ]] || die "Refusing to overwrite existing ${release_app}; choose a new output directory."
   [[ ! -e "${release_zip}" ]] || die "Refusing to overwrite existing ${release_zip}; choose a new output directory."
 
-  xcodebuild archive \
-    -project "${project_path}" \
-    -scheme "${scheme}" \
-    -configuration Release \
-    -destination 'generic/platform=macOS' \
-    -archivePath "${archive_path}" \
-    ARCHS="${architecture}" \
-    ONLY_ACTIVE_ARCH=NO \
-    CODE_SIGNING_ALLOWED=NO
-
-  [[ -d "${archive_app}" ]] || die "Archive did not contain ${archive_app}."
-  /usr/bin/ditto "${archive_app}" "${release_app}"
+  /bin/mkdir -p "${release_app}/Contents/MacOS" "${release_app}/Contents/Resources"
+  /usr/bin/ditto "Sleep-Disabler-Info.plist" "${release_app}/Contents/Info.plist"
+  swiftc \
+    -O \
+    -whole-module-optimization \
+    -module-cache-path "${module_cache_path}" \
+    -target "${architecture}-apple-macosx13.5" \
+    -sdk "${sdk_path}" \
+    -framework SwiftUI \
+    -framework AppKit \
+    -framework IOKit \
+    -framework ServiceManagement \
+    "${source_files[@]}" \
+    -o "${release_app}/Contents/MacOS/Sleep Disabler"
   sign_bundle "${release_app}"
 
   local built_architectures

@@ -5,9 +5,17 @@ Sleep Disabler ships two separate native app bundles, never a universal app:
 - `Sleep-Disabler-arm64.app` for Apple Silicon.
 - `Sleep-Disabler-x86_64.app` for Intel Macs.
 
-Run `zsh Scripts/archive-native.sh` on the build machine. It creates one archive
-with `ARCHS=arm64` and one with `ARCHS=x86_64`, then produces separately named
-`.app` and `.zip` artifacts for each architecture.
+From the project root, run `zsh Scripts/archive-native.sh` (do not use `sudo`).
+The script uses project-relative source and plist paths, so running it from the
+`Scripts` directory will fail. It uses only the Command Line Tools Swift compiler
+and macOS SDK to compile one `arm64` and one `x86_64` bundle, then produces
+separately named `.app` and `.zip` artifacts. It does not require or invoke the
+Xcode app or `xcodebuild`.
+
+```zsh
+cd "/path/to/Sleep Disabler"
+zsh Scripts/archive-native.sh
+```
 
 The script selects its release mode before building:
 

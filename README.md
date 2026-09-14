@@ -76,7 +76,7 @@ Only add a `sudoers` rule if you understand what it does. If you want to remove 
 3. Choose your Mac as the run destination.
 4. Build and run with `Command + R`.
 
-For release archives, run `zsh Scripts/archive-native.sh` as documented in [RELEASE.md](RELEASE.md). Do not combine the archives with `lipo`.
+For release archives, from the project root run `zsh Scripts/archive-native.sh` (without `sudo`) as documented in [RELEASE.md](RELEASE.md). Do not combine the archives with `lipo`.
 
 *(If you don't have the full Xcode app installed and want to build directly from Terminal using Command Line Tools, check out [compile.md](compile.md) for the full guide!)*
 
