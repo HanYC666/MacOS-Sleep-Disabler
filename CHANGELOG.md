@@ -2,6 +2,30 @@
 
 All notable changes to Sleep Disabler are documented here. Versions without an existing Git tag are chronological patch versions inferred from the commit history.
 
+## [2026-09-14] - 1.4.1
+
+### Added
+
+- Added separate native Apple Silicon and Intel release archive automation.
+- Added structured IOKit battery monitoring and power-source change notifications.
+- Added capability-gated lid dimmer availability and native settings controls for login and app mode.
+- Added automatic release-mode detection for notarized Developer ID archives or locally runnable development/ad-hoc archives.
+- Added persisted ownership tracking and a complete-restoration-baseline requirement for app-managed sleep settings.
+
+### Changed
+
+- Split power management, battery monitoring, lid monitoring, brightness, scheduling, privilege policy, and menu-bar behavior out of `AppState`.
+- Replaced the app-managed unrestricted `pmset` sudoers rule with a validated, versioned policy limited to the commands the app uses.
+- Replaced the recurring `ioreg` subprocess with direct IOKit lid reads, interest notifications, workspace power notifications, and conditional fallback monitoring.
+- Updated the Battery Power Failsafe to use the system-level IOKit power-provider value and re-evaluate immediately when its settings change.
+- Updated Lid-Closed Dimmer to resolve optional DisplayServices symbols at runtime and stay disabled when they are unavailable.
+- Updated native archives to verify their single architecture, sign exported bundles, and staple notarization before packaging when distribution credentials are available.
+
+### Fixed
+
+- Fixed partially failed sleep-disable operations by rolling settings back to their captured baseline.
+- Fixed optional private brightness symbols preventing the application from linking.
+
 ## [2026-09-07] - 1.3.0
 
 ### Added

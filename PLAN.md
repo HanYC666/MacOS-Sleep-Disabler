@@ -51,7 +51,7 @@ The current managed rule permits every invocation of `/usr/bin/pmset` without a 
 1. Inventory every privileged invocation before writing policy: disabling/enabling `disablesleep`, setting `sleep` and `displaysleep` for AC and battery, and `sleepnow`.
 2. Centralize those operations in `PowerManager` as typed commands. Reject every other argument combination before spawning a process.
 3. Generate `/etc/sudoers.d/sleep_disabler` with a versioned header and only anchored, exact command-argument rules. Do not use a wildcard such as `/usr/bin/pmset *`.
-4. Use sudoers regular expressions only after verifying the installed sudo supports them (sudo 1.9.10+). Bound numeric values to the valid `pmset` ranges. If that cannot be verified, do not fall back to a broad `pmset` rule; use a narrowly validating privileged helper instead.
+4. Use sudoers regular expressions only after verifying the installed sudo supports them (sudo 1.9.10+). Bound numeric values to the valid `pmset` ranges. If that cannot be verified, do not fall back to a broad `pmset` rule: generate an equivalent enumerated exact-command policy for the finite valid range.
 5. At startup, run unprivileged state reads and verify every required restricted command with `sudo -n`. Record whether the new policy is fully usable, missing, or requires migration.
 6. Check the managed file's versioned header and content through the authorized installer path. If it is the old `%admin ... NOPASSWD: /usr/bin/pmset` file, replace it atomically with the new restrictive file and validate it with `visudo -cf` before activation.
 7. Migration behavior: if an administrator authorization token or cached elevation is available, perform the replacement without an additional UI interruption. If it is not available, request one standard macOS authorization prompt. It is not technically safe or possible to rewrite the protected sudoers file silently using only the old rule, because that rule grants `pmset`, not file-write privileges.
@@ -81,7 +81,7 @@ Acceptance criteria: `AppState` no longer directly creates `Process` instances, 
 ## Phase 4 — Replace battery text parsing
 
 1. Replace the `pmset -g batt` call and percent regex with `IOPSCopyPowerSourcesInfo`, `IOPSCopyPowerSourcesList`, and `IOPSGetPowerSourceDescription`.
-2. Read `kIOPSCurrentCapacityKey` for percent and `kIOPSPowerSourceStateKey` to determine whether the Mac is drawing from battery power.
+2. Read `kIOPSCurrentCapacityKey` for percent and `IOPSGetProvidingPowerSourceType` to determine whether the Mac is drawing from battery power. The latter is the API specifically documented as identifying the power source currently providing power to the computer.
 3. Register `IOPSNotificationCreateRunLoopSource` so the failsafe re-evaluates when battery level or power source changes, rather than only on the current 30-second refresh timer.
 4. Preserve safe behavior when no internal battery is present: the failsafe should be unavailable, not treated as a zero-percent battery.
 5. Add unit tests for battery, AC, charging, missing battery, and threshold-edge cases.

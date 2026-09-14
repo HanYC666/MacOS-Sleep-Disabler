@@ -3,22 +3,15 @@
 //  Sleep Disabler
 //
 
-import SwiftUI
 import AppKit
-import ServiceManagement
 import Combine
-
-// C-Bridging for DisplayServices (Apple Silicon)
-@_silgen_name("DisplayServicesSetBrightness")
-func DisplayServicesSetBrightness(_ display: CGDirectDisplayID, _ brightness: Float) -> Int
-
-@_silgen_name("DisplayServicesGetBrightness")
-func DisplayServicesGetBrightness(_ display: CGDirectDisplayID, _ brightness: UnsafeMutablePointer<Float>) -> Int
+import ServiceManagement
+import SwiftUI
 
 @main
 struct SleepToggleApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) var appDelegate
-    @StateObject var appState = AppState()
+    @StateObject private var appState = AppState()
 
     var body: some Scene {
         WindowGroup {
@@ -32,22 +25,17 @@ struct SleepToggleApp: App {
                     appState.configureInitialWindow(window)
                 })
         }
-        .commands {
-            CommandGroup(replacing: .newItem) {}
-        }
+        .commands { CommandGroup(replacing: .newItem) {} }
     }
 }
 
-// MARK: - WINDOW ACCESSOR
 struct WindowAccessor: NSViewRepresentable {
-    var callback: (NSWindow) -> Void
+    let callback: (NSWindow) -> Void
 
     func makeNSView(context: Context) -> NSView {
         let view = NSView()
         DispatchQueue.main.async {
-            if let window = view.window {
-                callback(window)
-            }
+            if let window = view.window { callback(window) }
         }
         return view
     }
@@ -55,697 +43,350 @@ struct WindowAccessor: NSViewRepresentable {
     func updateNSView(_ nsView: NSView, context: Context) {}
 }
 
-// MARK: - APP STATE
 final class AppState: ObservableObject {
-    @Published var isFullySleepDisabled = false
-    @Published var launchAtLoginEnabled = false
+    @Published private(set) var isFullySleepDisabled = false
+    @Published private(set) var launchAtLoginEnabled = false
+    @Published private(set) var privilegePolicyStatus: PrivilegePolicyStatus = .missingOrInvalid
+    @Published private(set) var capabilities = HardwareCapabilities(hasInternalBattery: false, hasBuiltInDisplay: false)
 
-    @Published var menuBarMode = false {
-        didSet { UserDefaults.standard.set(menuBarMode, forKey: "menuBarMode") }
-    }
-
+    @Published var menuBarMode = false { didSet { UserDefaults.standard.set(menuBarMode, forKey: "menuBarMode"); applyMode() } }
     @Published var failsafeEnabled = false {
-        didSet { UserDefaults.standard.set(failsafeEnabled, forKey: "failsafeEnabled") }
+        didSet {
+            UserDefaults.standard.set(failsafeEnabled, forKey: "failsafeEnabled")
+            checkBatteryFailsafe()
+        }
     }
-
-    @Published var failsafeThreshold: Int = 20 {
-        didSet { UserDefaults.standard.set(failsafeThreshold, forKey: "failsafeThreshold") }
+    @Published var failsafeThreshold = 20 {
+        didSet {
+            UserDefaults.standard.set(failsafeThreshold, forKey: "failsafeThreshold")
+            checkBatteryFailsafe()
+        }
     }
-
     @Published var lidDimmerEnabled = false {
-        didSet { UserDefaults.standard.set(lidDimmerEnabled, forKey: "lidDimmerEnabled") }
-    }
-
-    @Published var sleepTimerDays = 0 {
         didSet {
-            UserDefaults.standard.set(sleepTimerDays, forKey: "sleepTimerDays")
+            if lidDimmerEnabled && !capabilities.supportsBrightnessDimming { lidDimmerEnabled = false; return }
+            UserDefaults.standard.set(lidDimmerEnabled, forKey: "lidDimmerEnabled")
+            updateLidMonitoring()
+            if !lidDimmerEnabled { brightnessManager.restore() }
             refreshMenuBar()
         }
     }
-
-    @Published var sleepTimerHours = 0 {
+    @Published var sleepTimerDays = 0 { didSet { saveTimerValue("sleepTimerDays", sleepTimerDays); refreshMenuBar() } }
+    @Published var sleepTimerHours = 0 { didSet { saveTimerValue("sleepTimerHours", sleepTimerHours); refreshMenuBar() } }
+    @Published var sleepTimerMinutes = 30 { didSet { saveTimerValue("sleepTimerMinutes", sleepTimerMinutes); refreshMenuBar() } }
+    @Published var sleepTimerLidClosedOnly = false { didSet { UserDefaults.standard.set(sleepTimerLidClosedOnly, forKey: "sleepTimerLidClosedOnly"); updateLidMonitoring() } }
+    @Published var sleepTimerSleepDisabledOnly = false { didSet { UserDefaults.standard.set(sleepTimerSleepDisabledOnly, forKey: "sleepTimerSleepDisabledOnly"); stopSchedulerIfNoLongerEligible() } }
+    @Published var sleepTimerRunning = false {
         didSet {
-            UserDefaults.standard.set(sleepTimerHours, forKey: "sleepTimerHours")
-            refreshMenuBar()
-        }
-    }
-
-    @Published var sleepTimerMinutes = 30 {
-        didSet {
-            UserDefaults.standard.set(sleepTimerMinutes, forKey: "sleepTimerMinutes")
-            refreshMenuBar()
-        }
-    }
-
-    @Published var sleepTimerLidClosedOnly = false {
-        didSet { UserDefaults.standard.set(sleepTimerLidClosedOnly, forKey: "sleepTimerLidClosedOnly") }
-    }
-
-    @Published var sleepTimerSleepDisabledOnly = false {
-        didSet {
-            UserDefaults.standard.set(sleepTimerSleepDisabledOnly, forKey: "sleepTimerSleepDisabledOnly")
-            if sleepTimerSleepDisabledOnly && sleepTimerRunning && !isFullySleepDisabled {
-                sleepTimerRunning = false
+            if sleepTimerRunning { startScheduler() }
+            else {
+                scheduler.stop()
+                updateLidMonitoring()
+                refreshMenuBar()
             }
         }
     }
-
-    @Published var sleepTimerRunning = false {
-        didSet { sleepTimerRunning ? startSleepTimer() : stopSleepTimer() }
-    }
-
     @Published private(set) var sleepTimerRemaining: TimeInterval = 0
 
-    private var statusItem: NSStatusItem?
-    private var refreshTimer: Timer?
-    private var isTogglingSleep = false
-
-    // Dimmer state
-    private var originalBrightness: Float? = nil
-    private var isCurrentlyDimmed = false
-    private var lidCheckTimer: Timer?
-    private var sleepTimer: Timer?
-    private var sleepTimerEndDate: Date?
-    private weak var sleepSchedulerRemainingMenuItem: NSMenuItem?
+    private let powerManager: PowerManager
+    private let batteryMonitor: BatteryMonitor
+    private let lidMonitor: LidMonitor
+    private let brightnessManager = BrightnessManager()
+    private let scheduler = Scheduler()
+    private let policyManager: PrivilegePolicyManager
+    private let menuBarController = MenuBarController()
+    private var batteryStatus = BatteryStatus(hasInternalBattery: false, percentage: nil, isDrawingFromBattery: false)
+    private var notificationWindow: NSWindow?
+    private var ownsSleepDisablement = false
 
     var hasSleepTimerDuration: Bool { sleepTimerDuration > 0 }
-
-    var sleepTimerRemainingText: String {
-        let seconds = max(0, Int(sleepTimerRemaining.rounded(.up)))
-        let days = seconds / 86_400
-        let hours = (seconds % 86_400) / 3_600
-        let minutes = (seconds % 3_600) / 60
-        let remainingSeconds = seconds % 60
-        if days > 0 { return "\(days)d \(hours)h \(minutes)m" }
-        if hours > 0 { return "\(hours)h \(minutes)m" }
-        if minutes > 0 { return "\(minutes)m \(remainingSeconds)s" }
-        return "\(remainingSeconds)s"
-    }
+    var supportsLidDimmer: Bool { capabilities.supportsBrightnessDimming && brightnessManager.isAvailable }
+    var supportsBatteryFailsafe: Bool { capabilities.hasInternalBattery }
+    var sleepTimerRemainingText: String { Self.durationText(sleepTimerRemaining, includeSeconds: true) }
 
     private var sleepTimerDuration: TimeInterval {
         TimeInterval(sleepTimerDays * 86_400 + sleepTimerHours * 3_600 + sleepTimerMinutes * 60)
     }
 
-    // Notification Window
-    private var notificationWindow: NSWindow?
+    init(
+        powerManager: PowerManager = PowerManager(),
+        batteryMonitor: BatteryMonitor = BatteryMonitor(),
+        lidMonitor: LidMonitor = LidMonitor(),
+        policyManager: PrivilegePolicyManager = PrivilegePolicyManager()
+    ) {
+        self.powerManager = powerManager
+        self.batteryMonitor = batteryMonitor
+        self.lidMonitor = lidMonitor
+        self.policyManager = policyManager
 
-    init() {
         menuBarMode = UserDefaults.standard.object(forKey: "menuBarMode") as? Bool ?? false
         failsafeEnabled = UserDefaults.standard.object(forKey: "failsafeEnabled") as? Bool ?? false
-        let threshold = UserDefaults.standard.integer(forKey: "failsafeThreshold")
-        failsafeThreshold = threshold > 0 ? threshold : 20
+        failsafeThreshold = min(max(UserDefaults.standard.object(forKey: "failsafeThreshold") as? Int ?? 20, 1), 99)
         lidDimmerEnabled = UserDefaults.standard.object(forKey: "lidDimmerEnabled") as? Bool ?? false
-        sleepTimerDays = min(max(0, UserDefaults.standard.integer(forKey: "sleepTimerDays")), 365)
-        sleepTimerHours = min(max(0, UserDefaults.standard.integer(forKey: "sleepTimerHours")), 23)
-        let savedMinutes = UserDefaults.standard.object(forKey: "sleepTimerMinutes") as? Int
-        sleepTimerMinutes = min(max(0, savedMinutes ?? 30), 59)
+        sleepTimerDays = min(max(UserDefaults.standard.integer(forKey: "sleepTimerDays"), 0), 365)
+        sleepTimerHours = min(max(UserDefaults.standard.integer(forKey: "sleepTimerHours"), 0), 23)
+        sleepTimerMinutes = min(max(UserDefaults.standard.object(forKey: "sleepTimerMinutes") as? Int ?? 30, 0), 59)
         sleepTimerLidClosedOnly = UserDefaults.standard.object(forKey: "sleepTimerLidClosedOnly") as? Bool ?? false
         sleepTimerSleepDisabledOnly = UserDefaults.standard.object(forKey: "sleepTimerSleepDisabledOnly") as? Bool ?? false
+        ownsSleepDisablement = UserDefaults.standard.bool(forKey: "sleepDisablerOwnsSleepDisablement")
 
-        updateActivationPolicy()
+        batteryMonitor.didChange = { [weak self] status in self?.handleBattery(status) }
+        lidMonitor.didChange = { [weak self] isClosed in self?.handleLidChange(isClosed) }
+        scheduler.didTick = { [weak self] remaining in self?.sleepTimerRemaining = remaining; self?.refreshMenuBar() }
+        scheduler.didFinish = { [weak self] in self?.sleepTimerRunning = false; self?.forceMacToSleep() }
+        configureMenuBarActions()
         refreshAll()
-
-        if menuBarMode {
-            createMenuBar()
-            DispatchQueue.main.async {
-                self.hideAllWindows()
-            }
-        }
-
-        startRefreshTimer()
-        startLidCheckTimer()
+        updateLidMonitoring()
+        applyMode()
     }
 
     func configureInitialWindow(_ window: NSWindow) {
         window.setContentSize(NSSize(width: 440, height: 620))
-        if menuBarMode {
-            window.orderOut(nil)
-        }
-    }
-
-    // MARK: - TIMERS
-    func startRefreshTimer() {
-        refreshTimer = Timer.scheduledTimer(withTimeInterval: 30, repeats: true) { [weak self] _ in
-            self?.refreshSleepState()
-            self?.refreshLaunchState()
-            self?.checkBatteryFailsafe()
-        }
-    }
-
-    func startLidCheckTimer() {
-        lidCheckTimer = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] _ in
-            self?.checkLidState()
-        }
+        if menuBarMode { window.orderOut(nil) }
     }
 
     func refreshAll() {
         refreshSleepState()
         refreshLaunchState()
+        refreshPrivilegePolicy()
+        batteryMonitor.refresh()
     }
 
-    // MARK: - MODE & WINDOW
-    func toggleMode() {
-        menuBarMode.toggle()
-        updateActivationPolicy()
+    func refreshPrivilegePolicy() { privilegePolicyStatus = policyManager.status() }
 
-        if menuBarMode {
-            createMenuBar()
-            hideAllWindows()
+    func installOrRepairPrivilegePolicy() -> Bool {
+        let installed = policyManager.installOrRepair()
+        refreshPrivilegePolicy()
+        return installed && privilegePolicyStatus == .restricted
+    }
+
+    func refreshSleepState() {
+        guard let disabled = powerManager.isSleepDisabled() else { return }
+        isFullySleepDisabled = disabled
+        stopSchedulerIfNoLongerEligible()
+        refreshMenuBar()
+    }
+
+    func toggleSleep() {
+        if isFullySleepDisabled {
+            guard ownsSleepDisablement, let settings = powerManager.savedSettings() else {
+                print("Sleep disabling was not created by this app, so its settings will not be changed.")
+                return
+            }
+            guard powerManager.restoreSleep(using: settings) else { return }
+            isFullySleepDisabled = false
+            setSleepDisablementOwnership(false)
+            brightnessManager.restore()
         } else {
-            removeMenuBar()
-            showWindow()
+            guard let settings = powerManager.saveCurrentSettingsIfNeeded(isSleepDisabled: false) else {
+                print("Sleep settings could not be read; refusing to change them without a restoration baseline.")
+                return
+            }
+            guard powerManager.disableSleep() else {
+                _ = powerManager.restoreSleep(using: settings)
+                return
+            }
+            isFullySleepDisabled = true
+            setSleepDisablementOwnership(true)
         }
+        stopSchedulerIfNoLongerEligible()
+        refreshMenuBar()
     }
 
-    func updateActivationPolicy() {
-        NSApp.setActivationPolicy(menuBarMode ? .accessory : .regular)
-    }
+    func toggleMode() { menuBarMode.toggle() }
 
     func showWindow() {
-        updateActivationPolicy()
+        NSApp.setActivationPolicy(.regular)
         NSApplication.shared.activate(ignoringOtherApps: true)
-
-        if let window = NSApplication.shared.windows.first(where: { $0.styleMask.contains(.titled) && $0 != notificationWindow }) {
-            if window.isMiniaturized {
-                window.deminiaturize(nil)
-            }
+        if let window = NSApplication.shared.windows.first(where: { $0 != notificationWindow && $0.styleMask.contains(.titled) }) {
+            if window.isMiniaturized { window.deminiaturize(nil) }
             window.makeKeyAndOrderFront(nil)
-            window.orderFrontRegardless()
         }
     }
 
     func hideAllWindows() {
-        for window in NSApplication.shared.windows {
-            if window != notificationWindow {
-                window.orderOut(nil)
-            }
+        NSApplication.shared.windows.filter { $0 != notificationWindow }.forEach { $0.orderOut(nil) }
+    }
+
+    func refreshLaunchState() { launchAtLoginEnabled = SMAppService.mainApp.status == .enabled }
+
+    func setLaunchAtLogin(_ enabled: Bool) {
+        do {
+            if enabled { try SMAppService.mainApp.register() } else { try SMAppService.mainApp.unregister() }
+        } catch {
+            print("Launch at login update failed: \(error)")
         }
-        updateActivationPolicy()
-    }
-
-    // MARK: - MENU BAR
-    func createMenuBar() {
-        if statusItem != nil { return }
-        statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
-        updateMenuBarIcon()
-
-        let menu = NSMenu()
-
-        let toggle = NSMenuItem(
-            title: isFullySleepDisabled ? "Enable Sleep" : "Disable Sleep",
-            action: #selector(toggleSleepMenu),
-            keyEquivalent: ""
-        )
-        toggle.target = self
-        menu.addItem(toggle)
-        menu.addItem(.separator())
-
-        let dimmer = NSMenuItem(
-            title: lidDimmerEnabled ? "Disable Lid Dimmer" : "Enable Lid Dimmer",
-            action: #selector(toggleDimmerMenu),
-            keyEquivalent: ""
-        )
-        dimmer.target = self
-        menu.addItem(dimmer)
-        menu.addItem(.separator())
-
-        if sleepTimerRunning {
-            let remaining = NSMenuItem(
-                title: "Sleep Scheduler: \(sleepTimerRemainingText) remaining",
-                action: nil,
-                keyEquivalent: ""
-            )
-            remaining.isEnabled = false
-            menu.addItem(remaining)
-            sleepSchedulerRemainingMenuItem = remaining
-        }
-
-        let timer = NSMenuItem(
-            title: sleepTimerRunning ? "Stop Sleep Scheduler" : "Start Last Used Sleep Scheduler (\(savedSleepTimerDescription))",
-            action: #selector(toggleSleepTimerMenu),
-            keyEquivalent: ""
-        )
-        timer.target = self
-        timer.isEnabled = sleepTimerRunning || hasSleepTimerDuration
-        menu.addItem(timer)
-        menu.addItem(.separator())
-
-        let show = NSMenuItem(
-            title: "Show Window",
-            action: #selector(showWindowMenu),
-            keyEquivalent: ""
-        )
-        show.target = self
-        menu.addItem(show)
-
-        let mode = NSMenuItem(
-            title: menuBarMode ? "Switch to Window Mode" : "Switch to Menu Bar Mode",
-            action: #selector(toggleModeMenu),
-            keyEquivalent: ""
-        )
-        mode.target = self
-        menu.addItem(mode)
-        menu.addItem(.separator())
-
-        let login = NSMenuItem(
-            title: launchAtLoginEnabled ? "Disable Login Item" : "Enable Login Item",
-            action: #selector(toggleLoginMenu),
-            keyEquivalent: ""
-        )
-        login.target = self
-        menu.addItem(login)
-        menu.addItem(.separator())
-
-        let quit = NSMenuItem(
-            title: "Quit",
-            action: #selector(quitMenu),
-            keyEquivalent: ""
-        )
-        quit.target = self
-        menu.addItem(quit)
-
-        statusItem?.menu = menu
-    }
-
-    func removeMenuBar() {
-        if let item = statusItem {
-            NSStatusBar.system.removeStatusItem(item)
-        }
-        statusItem = nil
-    }
-
-    func refreshMenuBar() {
-        removeMenuBar()
-        if menuBarMode {
-            createMenuBar()
-        }
-    }
-
-    func updateMenuBarIcon() {
-        statusItem?.button?.image = NSImage(
-            systemSymbolName: isFullySleepDisabled ? "lock.open.fill" : "lock.fill",
-            accessibilityDescription: nil
-        )
-    }
-
-    @objc func toggleSleepMenu() { toggleSleep() }
-    @objc func showWindowMenu() { showWindow() }
-    @objc func toggleModeMenu() { toggleMode() }
-    @objc func toggleLoginMenu() { toggleLaunchAtLogin() }
-    @objc func toggleDimmerMenu() {
-        lidDimmerEnabled.toggle()
+        refreshLaunchState()
         refreshMenuBar()
     }
-    @objc func toggleSleepTimerMenu() { sleepTimerRunning.toggle() }
-    @objc func quitMenu() { NSApp.terminate(nil) }
 
-    // MARK: - SLEEP STATE MANAGEMENT
-    func refreshSleepState() {
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/usr/bin/pmset")
-        process.arguments = ["-g", "custom"]
-        let pipe = Pipe()
-        process.standardOutput = pipe
-
-        do {
-            try process.run()
-            process.waitUntilExit()
-            let data = pipe.fileHandleForReading.readDataToEndOfFile()
-            let output = String(decoding: data, as: UTF8.self)
-
-            let isDisabled = output.range(
-                of: #"(?m)^\s*(sleep\s+0|disablesleep\s+1)\b"#,
-                options: .regularExpression
-            ) != nil
-
-            DispatchQueue.main.async {
-                guard self.isTogglingSleep == false else { return }
-                self.isFullySleepDisabled = isDisabled
-                if self.sleepTimerSleepDisabledOnly && self.sleepTimerRunning && !isDisabled {
-                    self.sleepTimerRunning = false
-                }
-                self.updateMenuBarIcon()
-                self.refreshMenuBar()
-            }
-        } catch {
-            print("refreshSleepState error: \(error)")
+    func prepareForTermination() {
+        scheduler.stop()
+        brightnessManager.restore()
+        if isFullySleepDisabled, ownsSleepDisablement,
+           let settings = powerManager.savedSettings(), powerManager.restoreSleep(using: settings) {
+            isFullySleepDisabled = false
+            setSleepDisablementOwnership(false)
         }
     }
 
-    func saveCurrentPmsetValues() {
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/usr/bin/pmset")
-        process.arguments = ["-g", "custom"]
-        let pipe = Pipe()
-        process.standardOutput = pipe
-
-        do {
-            try process.run()
-            process.waitUntilExit()
-            let data = pipe.fileHandleForReading.readDataToEndOfFile()
-            let output = String(decoding: data, as: UTF8.self)
-
-            var currentSection = ""
-            var battSleep = -1, battDisplay = -1
-            var acSleep = -1, acDisplay = -1
-
-            for line in output.components(separatedBy: .newlines) {
-                let lower = line.lowercased()
-                if lower.contains("battery power:") {
-                    currentSection = "batt"
-                } else if lower.contains("ac power:") {
-                    currentSection = "ac"
-                }
-
-                let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
-                let tokens = trimmed.components(separatedBy: .whitespaces).filter { !$0.isEmpty }
-                if tokens.count >= 2 {
-                    let key = tokens[0].lowercased()
-                    if let val = Int(tokens[1]) {
-                        if key == "sleep" {
-                            if currentSection == "batt" { battSleep = val }
-                            else if currentSection == "ac" { acSleep = val }
-                        } else if key == "displaysleep" {
-                            if currentSection == "batt" { battDisplay = val }
-                            else if currentSection == "ac" { acDisplay = val }
-                        }
-                    }
-                }
-            }
-
-            print("pmset parsed values -> Batt: sleep=\(battSleep), disp=\(battDisplay) | AC: sleep=\(acSleep), disp=\(acDisplay)")
-
-            if !isFullySleepDisabled {
-                if battSleep >= 0 { UserDefaults.standard.set(battSleep, forKey: "origBattSleep") }
-                if battDisplay >= 0 { UserDefaults.standard.set(battDisplay, forKey: "origBattDisplay") }
-                if acSleep >= 0 { UserDefaults.standard.set(acSleep, forKey: "origAcSleep") }
-                if acDisplay >= 0 { UserDefaults.standard.set(acDisplay, forKey: "origAcDisplay") }
-            }
-        } catch {
-            print("Failed to read pmset custom settings: \(error)")
-        }
+    private func handleBattery(_ status: BatteryStatus) {
+        batteryStatus = status
+        let updatedCapabilities = HardwareCapabilities.detect(hasInternalBattery: status.hasInternalBattery)
+        capabilities = HardwareCapabilities(
+            hasInternalBattery: status.hasInternalBattery,
+            hasBuiltInDisplay: capabilities.hasBuiltInDisplay || updatedCapabilities.hasBuiltInDisplay
+        )
+        if !capabilities.supportsBrightnessDimming && lidDimmerEnabled { lidDimmerEnabled = false }
+        checkBatteryFailsafe()
     }
 
-    func toggleSleep() {
-        isTogglingSleep = true
-        let enabling = !isFullySleepDisabled
-
-        if !enabling && sleepTimerSleepDisabledOnly && sleepTimerRunning {
-            sleepTimerRunning = false
-        }
-
-        if enabling {
-            saveCurrentPmsetValues()
-            runCommand(["-a", "disablesleep", "1"])
-            runCommand(["-a", "sleep", "0"])
-            runCommand(["-a", "displaysleep", "0"])
-        } else {
-            let bSleep = UserDefaults.standard.object(forKey: "origBattSleep") as? Int ?? 10
-            let bDisp = UserDefaults.standard.object(forKey: "origBattDisplay") as? Int ?? 10
-            let cSleep = UserDefaults.standard.object(forKey: "origAcSleep") as? Int ?? 10
-            let cDisp = UserDefaults.standard.object(forKey: "origAcDisplay") as? Int ?? 10
-
-            print("Restoring settings -> Batt: sleep=\(bSleep), disp=\(bDisp) | AC: sleep=\(cSleep), disp=\(cDisp)")
-
-            runCommand(["-a", "disablesleep", "0"])
-            runCommand(["-b", "sleep", "\(bSleep)"])
-            runCommand(["-b", "displaysleep", "\(bDisp)"])
-            runCommand(["-c", "sleep", "\(cSleep)"])
-            runCommand(["-c", "displaysleep", "\(cDisp)"])
-        }
-
-        DispatchQueue.main.async {
-            self.isFullySleepDisabled = enabling
-            self.updateMenuBarIcon()
-            self.refreshMenuBar()
-        }
-
-        DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
-            self.isTogglingSleep = false
-            self.refreshSleepState()
-        }
-    }
-
-    // MARK: - BATTERY FAILSAFE
-    func checkBatteryFailsafe() {
-        guard failsafeEnabled, isFullySleepDisabled else { return }
-
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/usr/bin/pmset")
-        process.arguments = ["-g", "batt"]
-        let pipe = Pipe()
-        process.standardOutput = pipe
-
-        do {
-            try process.run()
-            process.waitUntilExit()
-            let output = String(decoding: pipe.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
-
-            let isDischarging = output.contains("Now drawing from 'Battery Power'")
-            if isDischarging, let match = output.range(of: #"(\d+)%"#, options: .regularExpression) {
-                let percStr = output[match].dropLast()
-                if let perc = Int(percStr), perc < failsafeThreshold {
-                    triggerFailsafe()
-                }
-            }
-        } catch {}
-    }
-
-    func triggerFailsafe() {
-        DispatchQueue.main.async {
-            self.showNotificationWindow()
-        }
+    private func checkBatteryFailsafe() {
+        guard failsafeEnabled, isFullySleepDisabled, batteryStatus.hasInternalBattery,
+              batteryStatus.isDrawingFromBattery, let percentage = batteryStatus.percentage,
+              percentage < failsafeThreshold else { return }
+        showNotificationWindow()
         forceMacToSleep()
     }
 
-    func showNotificationWindow() {
+    private func handleLidChange(_ isClosed: Bool) {
+        if sleepTimerRunning && sleepTimerLidClosedOnly && !isClosed { sleepTimerRunning = false }
+        guard lidDimmerEnabled, isFullySleepDisabled, supportsLidDimmer else {
+            brightnessManager.restore()
+            return
+        }
+        if isClosed { brightnessManager.dimIfPossible(capabilities: capabilities) } else { brightnessManager.restore() }
+    }
+
+    private func updateLidMonitoring() {
+        lidMonitor.setMonitoringActive(capabilities.supportsLidState && ((lidDimmerEnabled && supportsLidDimmer) || (sleepTimerRunning && sleepTimerLidClosedOnly)))
+    }
+
+    private func startScheduler() {
+        guard hasSleepTimerDuration,
+              (!sleepTimerLidClosedOnly || lidMonitor.currentLidClosed()),
+              (!sleepTimerSleepDisabledOnly || isFullySleepDisabled) else {
+            if sleepTimerRunning { sleepTimerRunning = false }
+            return
+        }
+        scheduler.start(duration: sleepTimerDuration)
+        updateLidMonitoring()
+        refreshMenuBar()
+    }
+
+    private func stopSchedulerIfNoLongerEligible() {
+        if sleepTimerRunning && sleepTimerSleepDisabledOnly && !isFullySleepDisabled { sleepTimerRunning = false }
+    }
+
+    private func forceMacToSleep() {
+        brightnessManager.restore()
+        if isFullySleepDisabled, ownsSleepDisablement {
+            guard let settings = powerManager.savedSettings(), powerManager.restoreSleep(using: settings) else { return }
+            isFullySleepDisabled = false
+            setSleepDisablementOwnership(false)
+        }
+        _ = powerManager.sleepNow()
+        refreshMenuBar()
+    }
+
+    private func showNotificationWindow() {
         if notificationWindow == nil {
-            let notifView = NotificationView()
-            let hostingController = NSHostingController(rootView: notifView)
-            let win = NSWindow(
-                contentRect: NSRect(x: 0, y: 0, width: 320, height: 180),
-                styleMask: [.titled, .closable],
-                backing: .buffered,
-                defer: false
-            )
-            win.title = "Critical Battery"
-            win.contentViewController = hostingController
-            win.isReleasedWhenClosed = false
-            win.level = .floating
-            notificationWindow = win
+            let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 320, height: 180), styleMask: [.titled, .closable], backing: .buffered, defer: false)
+            window.title = "Critical Battery"
+            window.contentViewController = NSHostingController(rootView: NotificationView())
+            window.isReleasedWhenClosed = false
+            window.level = .floating
+            notificationWindow = window
         }
         notificationWindow?.center()
         notificationWindow?.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
     }
 
-    // MARK: - LID DIMMER
-    func checkLidState() {
-        guard lidDimmerEnabled || (sleepTimerRunning && sleepTimerLidClosedOnly) else {
-            if isCurrentlyDimmed { restoreBrightness() }
-            return
-        }
-
-        let isClosed = isLidClosed()
-
-        if sleepTimerRunning && sleepTimerLidClosedOnly && !isClosed {
-            sleepTimerRunning = false
-        }
-
-        guard lidDimmerEnabled, isFullySleepDisabled else {
-            if isCurrentlyDimmed { restoreBrightness() }
-            return
-        }
-
-        if isClosed && !isCurrentlyDimmed {
-            dimBrightness()
-        } else if !isClosed && isCurrentlyDimmed {
-            restoreBrightness()
-        }
-    }
-
-    private func isLidClosed() -> Bool {
-        let p = Process()
-        p.executableURL = URL(fileURLWithPath: "/usr/sbin/ioreg")
-        p.arguments = ["-r", "-k", "AppleClamshellState", "-d", "4"]
-        let pipe = Pipe()
-        p.standardOutput = pipe
-        try? p.run()
-        p.waitUntilExit()
-        let out = String(decoding: pipe.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
-        return out.contains("\"AppleClamshellState\" = Yes")
-    }
-
-    func dimBrightness() {
-        let display = CGMainDisplayID()
-        var current: Float = 0
-        _ = DisplayServicesGetBrightness(display, &current)
-        originalBrightness = current
-        _ = DisplayServicesSetBrightness(display, 0.0)
-        isCurrentlyDimmed = true
-    }
-
-    func restoreBrightness() {
-        if let orig = originalBrightness {
-            _ = DisplayServicesSetBrightness(CGMainDisplayID(), orig)
-        }
-        isCurrentlyDimmed = false
-    }
-
-    // MARK: - SLEEP TIMER
-    func startSleepTimer() {
-        guard hasSleepTimerDuration else {
-            sleepTimerRunning = false
-            return
-        }
-        guard !sleepTimerLidClosedOnly || isLidClosed() else {
-            sleepTimerRunning = false
-            return
-        }
-        guard !sleepTimerSleepDisabledOnly || isFullySleepDisabled else {
-            sleepTimerRunning = false
-            return
-        }
-
-        stopSleepTimer()
-        sleepTimerEndDate = Date().addingTimeInterval(sleepTimerDuration)
-        updateSleepTimerRemaining()
-        let timer = Timer(timeInterval: 1, repeats: true) { [weak self] _ in
-            self?.updateSleepTimerRemaining()
-        }
-        RunLoop.main.add(timer, forMode: .common)
-        sleepTimer = timer
+    private func applyMode() {
+        NSApp.setActivationPolicy(menuBarMode ? .accessory : .regular)
         refreshMenuBar()
+        if menuBarMode { hideAllWindows() } else { menuBarController.remove() }
     }
 
-    func stopSleepTimer() {
-        sleepTimer?.invalidate()
-        sleepTimer = nil
-        sleepTimerEndDate = nil
-        sleepTimerRemaining = 0
-        refreshMenuBar()
+    private func configureMenuBarActions() {
+        menuBarController.onToggleSleep = { [weak self] in self?.toggleSleep() }
+        menuBarController.onToggleDimmer = { [weak self] in self?.lidDimmerEnabled.toggle() }
+        menuBarController.onToggleScheduler = { [weak self] in self?.sleepTimerRunning.toggle() }
+        menuBarController.onShowWindow = { [weak self] in self?.showWindow() }
+        menuBarController.onToggleMode = { [weak self] in self?.toggleMode() }
+        menuBarController.onToggleLogin = { [weak self] in guard let self else { return }; self.setLaunchAtLogin(!self.launchAtLoginEnabled) }
+        menuBarController.onQuit = { NSApp.terminate(nil) }
     }
 
-    private func updateSleepTimerRemaining() {
-        guard let endDate = sleepTimerEndDate else { return }
-        let remaining = endDate.timeIntervalSinceNow
-        if remaining <= 0 {
-            sleepTimerRunning = false
-            forceMacToSleep()
-        } else {
-            sleepTimerRemaining = remaining
-            sleepSchedulerRemainingMenuItem?.title = "Sleep Scheduler: \(sleepTimerRemainingText) remaining"
-        }
+    private func refreshMenuBar() {
+        menuBarController.update(MenuBarPresentation(
+            sleepDisabled: isFullySleepDisabled,
+            lidDimmerEnabled: lidDimmerEnabled,
+            lidDimmerAvailable: supportsLidDimmer,
+            schedulerRunning: sleepTimerRunning,
+            schedulerText: sleepTimerRemainingText,
+            schedulerCanStart: hasSleepTimerDuration,
+            savedDurationText: Self.durationText(sleepTimerDuration, includeSeconds: false),
+            menuBarMode: menuBarMode,
+            launchAtLoginEnabled: launchAtLoginEnabled
+        ))
     }
 
-    private var savedSleepTimerDescription: String {
-        let components = [
-            sleepTimerDays > 0 ? "\(sleepTimerDays)d" : nil,
-            sleepTimerHours > 0 ? "\(sleepTimerHours)h" : nil,
-            sleepTimerMinutes > 0 ? "\(sleepTimerMinutes)m" : nil
-        ].compactMap { $0 }
-        return components.joined(separator: " ")
+    private func saveTimerValue(_ key: String, _ value: Int) { UserDefaults.standard.set(value, forKey: key) }
+
+    private func setSleepDisablementOwnership(_ owns: Bool) {
+        ownsSleepDisablement = owns
+        UserDefaults.standard.set(owns, forKey: "sleepDisablerOwnsSleepDisablement")
     }
 
-    private func forceMacToSleep() {
-        if isCurrentlyDimmed { restoreBrightness() }
-        let needsRestore = isFullySleepDisabled
-        if needsRestore { toggleSleep() }
-
-        DispatchQueue.main.asyncAfter(deadline: .now() + (needsRestore ? 1.5 : 0)) {
-            self.runCommand(["sleepnow"])
-        }
-    }
-
-    // MARK: - LAUNCH AT LOGIN
-    func refreshLaunchState() {
-        launchAtLoginEnabled = SMAppService.mainApp.status == .enabled
-    }
-
-    func toggleLaunchAtLogin() {
-        do {
-            if launchAtLoginEnabled {
-                try SMAppService.mainApp.unregister()
-            } else {
-                try SMAppService.mainApp.register()
-            }
-            refreshLaunchState()
-            refreshMenuBar()
-        } catch {
-            print("toggleLaunchAtLogin error: \(error)")
-        }
-    }
-
-    // MARK: - COMMAND EXECUTION
-    func runCommand(_ args: [String]) {
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/usr/bin/sudo")
-        process.arguments = ["-n", "/usr/bin/pmset"] + args
-        do {
-            try process.run()
-            process.waitUntilExit()
-        } catch {
-            print("runCommand error: \(error)")
-        }
+    private static func durationText(_ duration: TimeInterval, includeSeconds: Bool) -> String {
+        let seconds = max(0, Int(duration.rounded(.up)))
+        let days = seconds / 86_400
+        let hours = (seconds % 86_400) / 3_600
+        let minutes = (seconds % 3_600) / 60
+        let remainingSeconds = seconds % 60
+        if days > 0 { return "\(days)d \(hours)h \(minutes)m" }
+        if hours > 0 { return "\(hours)h \(minutes)m" }
+        if minutes > 0 { return includeSeconds ? "\(minutes)m \(remainingSeconds)s" : "\(minutes)m" }
+        return includeSeconds ? "\(remainingSeconds)s" : "0m"
     }
 }
 
-// MARK: - APP DELEGATE
 final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     weak var mainWindow: NSWindow?
     weak var appState: AppState?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
-        DispatchQueue.main.async {
-            self.checkPmsetPermission()
-        }
+        DispatchQueue.main.async { self.checkPrivilegePolicy() }
     }
 
+    func applicationWillTerminate(_ notification: Notification) { appState?.prepareForTermination() }
+
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
-        appState?.updateActivationPolicy()
         appState?.showWindow()
-        return false // Prevents macOS / SwiftUI from creating duplicate windows
+        return false
     }
 
     func windowShouldClose(_ sender: NSWindow) -> Bool {
         sender.orderOut(nil)
-        appState?.updateActivationPolicy()
-        return false // Prevents SwiftUI from destroying the window!
+        return false
     }
 
-    func checkPmsetPermission() {
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/usr/bin/sudo")
-        process.arguments = ["-n", "/usr/bin/pmset", "-g"]
-        do {
-            try process.run()
-            process.waitUntilExit()
-            if process.terminationStatus == 0 { return }
-        } catch { }
-        promptForSudoersInstall()
-    }
-
-    func promptForSudoersInstall() {
+    private func checkPrivilegePolicy() {
+        guard let appState, appState.privilegePolicyStatus != .restricted else { return }
         let alert = NSAlert()
-        alert.messageText = "Permission Required"
-        alert.informativeText = "Install pmset permission rule?"
-        alert.addButton(withTitle: "Enable")
-        alert.addButton(withTitle: "Cancel")
-        if alert.runModal() == .alertFirstButtonReturn {
-            installSudoers()
+        alert.messageText = appState.privilegePolicyStatus == .legacyBroadRule ? "Update Sleep Disabler Permission" : "Repair Sleep Disabler Permission"
+        alert.informativeText = appState.privilegePolicyStatus == .legacyBroadRule
+            ? "Sleep Disabler found its older broad pmset permission. Update it to the new restricted policy?"
+            : "Install or repair the restricted permission needed for Sleep Disabler's exact power-management commands?"
+        alert.addButton(withTitle: appState.privilegePolicyStatus == .legacyBroadRule ? "Update" : "Repair")
+        alert.addButton(withTitle: "Not Now")
+        if alert.runModal() == .alertFirstButtonReturn, !appState.installOrRepairPrivilegePolicy() {
+            let failure = NSAlert()
+            failure.messageText = "Permission Was Not Installed"
+            failure.informativeText = "Sleep Disabler could not validate or install its restricted policy. No power settings were changed."
+            failure.runModal()
         }
-    }
-
-    func installSudoers() {
-        let temp = "/tmp/sleep_disabler"
-        let content = "%admin ALL=(ALL) NOPASSWD: /usr/bin/pmset\n"
-        try? content.write(toFile: temp, atomically: true, encoding: .utf8)
-        let cmd = "sudo mkdir -p /etc/sudoers.d && sudo cp \(temp) /etc/sudoers.d/sleep_disabler && sudo chmod 440 /etc/sudoers.d/sleep_disabler"
-        let p = Process()
-        p.executableURL = URL(fileURLWithPath: "/bin/zsh")
-        p.arguments = ["-c", cmd]
-        try? p.run()
-        p.waitUntilExit()
-        try? FileManager.default.removeItem(atPath: temp)
     }
 }

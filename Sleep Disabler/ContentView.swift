@@ -71,8 +71,16 @@ struct MainView: View {
                     Text("Battery Power Failsafe")
                         .fontWeight(.medium)
                 }
+                .disabled(!appState.supportsBatteryFailsafe)
 
-                if appState.failsafeEnabled {
+                if !appState.supportsBatteryFailsafe {
+                    Text("Available when this Mac has an internal battery.")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                        .accessibilityLabel("Battery Power Failsafe is available when this Mac has an internal battery")
+                }
+
+                if appState.failsafeEnabled && appState.supportsBatteryFailsafe {
                     Text("Restores sleep settings and puts the Mac to sleep if battery percentage falls below this value.")
                         .font(.caption)
                         .foregroundColor(.secondary)
@@ -129,8 +137,16 @@ struct MainView: View {
                     Text("Lid-Closed Dimmer (When Disabled)")
                         .fontWeight(.medium)
                 }
+                .disabled(!appState.supportsLidDimmer)
 
-                if appState.lidDimmerEnabled {
+                if !appState.supportsLidDimmer {
+                    Text("Available on MacBooks only.")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                        .accessibilityLabel("Lid-Closed Dimmer is available on MacBooks only")
+                }
+
+                if appState.lidDimmerEnabled && appState.supportsLidDimmer {
                     Text("Turns display brightness to 0% when laptop lid is closed to save battery, restoring it when opened.")
                         .font(.caption)
                         .foregroundColor(.secondary)
@@ -141,21 +157,44 @@ struct MainView: View {
 
             Divider()
 
-            Button {
-                appState.toggleLaunchAtLogin()
-            } label: {
-                Text(appState.launchAtLoginEnabled ? "Disable Login Item" : "Enable Login Item")
-                    .frame(minWidth: 160)
-            }
+            VStack(spacing: 10) {
+                HStack(alignment: .firstTextBaseline) {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("Launch at Login")
+                            .fontWeight(.medium)
+                        Text("Starts Sleep Disabler when you sign in.")
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                    }
+                    Spacer()
+                    Toggle("Launch at Login", isOn: Binding(
+                        get: { appState.launchAtLoginEnabled },
+                        set: { appState.setLaunchAtLogin($0) }
+                    ))
+                    .labelsHidden()
+                    .accessibilityLabel("Launch at Login")
+                }
 
-            Divider()
-
-            Button {
-                appState.toggleMode()
-            } label: {
-                Text(appState.menuBarMode ? "Switch to Window Mode" : "Switch to Menu Bar Mode")
-                    .frame(minWidth: 180)
+                HStack(alignment: .firstTextBaseline) {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("App Mode")
+                            .fontWeight(.medium)
+                        Text(appState.menuBarMode ? "Menu Bar mode hides the main window." : "Window mode shows the main window.")
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                    }
+                    Picker("App Mode", selection: $appState.menuBarMode) {
+                        Text("Window").tag(false)
+                        Text("Menu Bar").tag(true)
+                    }
+                    .pickerStyle(.segmented)
+                    .frame(width: 156)
+                    .accessibilityLabel("App Mode")
+                }
             }
+            .padding(10)
+            .background(Color(nsColor: .controlBackgroundColor).opacity(0.55))
+            .clipShape(RoundedRectangle(cornerRadius: 7))
 
             Spacer()
         }
