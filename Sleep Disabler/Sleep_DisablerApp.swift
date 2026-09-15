@@ -40,20 +40,35 @@ struct SleepToggleApp: App {
     @StateObject var appState = AppState()
 
     var body: some Scene {
-        WindowGroup {
-            MainView()
-                .environmentObject(appState)
-                .background(WindowAccessor { window in
-                    appDelegate.mainWindow = window
-                    appDelegate.appState = appState
-                    window.delegate = appDelegate
-                    window.isReleasedWhenClosed = false
-                    appState.configureInitialWindow(window)
-                })
+        WindowGroup(id: "main") {
+            MainWindowRoot(appState: appState, appDelegate: appDelegate)
         }
         .commands {
             CommandGroup(replacing: .newItem) {}
         }
+    }
+}
+
+private struct MainWindowRoot: View {
+    @Environment(\.openWindow) private var openWindow
+    @ObservedObject var appState: AppState
+    let appDelegate: AppDelegate
+
+    var body: some View {
+        MainView()
+            .environmentObject(appState)
+            .background(WindowAccessor { window in
+                appDelegate.mainWindow = window
+                appDelegate.appState = appState
+                window.delegate = appDelegate
+                window.isReleasedWhenClosed = false
+                appState.configureInitialWindow(window)
+            })
+            .onAppear {
+                appState.setMainWindowOpener {
+                    openWindow(id: "main")
+                }
+            }
     }
 }
 
@@ -207,6 +222,10 @@ final class AppState: ObservableObject {
     }
 
     // Notification Window
+    private var mainWindow: NSWindow?
+    private var openMainWindowAction: (() -> Void)?
+    private var isOpeningMainWindow = false
+    private var shouldRevealNextMainWindow = false
     private var notificationWindow: NSWindow?
 
     init() {
@@ -289,13 +308,29 @@ final class AppState: ObservableObject {
     }
 
     func configureInitialWindow(_ window: NSWindow) {
+        mainWindow = window
+        isOpeningMainWindow = false
+        let shouldReveal = shouldRevealNextMainWindow
+        shouldRevealNextMainWindow = false
         window.setContentSize(NSSize(width: 440, height: 620))
-        if menuBarMode {
+        window.collectionBehavior.insert(.moveToActiveSpace)
+        if menuBarMode && !shouldReveal {
             window.alphaValue = 0
             window.animationBehavior = .none
             window.orderOut(nil)
         } else {
             window.alphaValue = 1
+        }
+    }
+
+    func setMainWindowOpener(_ action: @escaping () -> Void) {
+        openMainWindowAction = action
+    }
+
+    func mainWindowWillClose(_ window: NSWindow) {
+        if let mainWindow, mainWindow === window {
+            self.mainWindow = nil
+            isOpeningMainWindow = false
         }
     }
 
@@ -349,9 +384,8 @@ final class AppState: ObservableObject {
 
     func showWindow() {
         updateActivationPolicy()
-        NSApplication.shared.activate(ignoringOtherApps: true)
-
-        if let window = NSApplication.shared.windows.first(where: { $0.styleMask.contains(.titled) && $0 != notificationWindow }) {
+        if let window = mainWindow {
+            NSApplication.shared.activate(ignoringOtherApps: true)
             window.alphaValue = 1
             window.animationBehavior = .default
             if window.isMiniaturized {
@@ -359,6 +393,15 @@ final class AppState: ObservableObject {
             }
             window.makeKeyAndOrderFront(nil)
             window.orderFrontRegardless()
+            return
+        }
+
+        guard !isOpeningMainWindow, let openMainWindowAction else { return }
+        isOpeningMainWindow = true
+        shouldRevealNextMainWindow = true
+        openMainWindowAction()
+        DispatchQueue.main.async {
+            NSApplication.shared.activate(ignoringOtherApps: true)
         }
     }
 
@@ -963,9 +1006,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
 
     func windowShouldClose(_ sender: NSWindow) -> Bool {
-        sender.orderOut(nil)
         appState?.updateActivationPolicy()
-        return false // Prevents SwiftUI from destroying the window!
+        return true
+    }
+
+    func windowWillClose(_ notification: Notification) {
+        guard let window = notification.object as? NSWindow else { return }
+        appState?.mainWindowWillClose(window)
+        if let mainWindow, mainWindow === window {
+            self.mainWindow = nil
+        }
     }
 
     func checkPmsetPermission() {

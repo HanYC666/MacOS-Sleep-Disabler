@@ -2,6 +2,12 @@
 
 All notable changes to Sleep Disabler are documented here. Versions without an existing Git tag are chronological patch versions inferred from the commit history.
 
+## [2026-09-15] - 1.4.3
+
+### Fixed
+
+- Fixed menu-bar window actions failing to reopen a closed main window or show it after switching to another desktop.
+
 ## [2026-09-15] - 1.4.2
 
 ### Changed
