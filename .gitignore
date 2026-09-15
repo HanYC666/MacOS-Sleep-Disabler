@@ -14,3 +14,5 @@ Pods/
 
 # Secrets (if you use an environment file for API keys)
 .env
+task.md
+PLAN.md

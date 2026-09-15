@@ -71,8 +71,13 @@ struct MainView: View {
                     Text("Battery Power Failsafe")
                         .fontWeight(.medium)
                 }
+                .disabled(!appState.supportsBatteryFailsafe)
 
-                if appState.failsafeEnabled {
+                if !appState.supportsBatteryFailsafe {
+                    Text("Available when this Mac has an internal battery.")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                } else if appState.failsafeEnabled {
                     Text("Restores sleep settings and puts the Mac to sleep if battery percentage falls below this value.")
                         .font(.caption)
                         .foregroundColor(.secondary)
@@ -129,8 +134,13 @@ struct MainView: View {
                     Text("Lid-Closed Dimmer (When Disabled)")
                         .fontWeight(.medium)
                 }
+                .disabled(!appState.supportsLidDimmer)
 
-                if appState.lidDimmerEnabled {
+                if !appState.supportsLidDimmer {
+                    Text("Available on MacBooks only.")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                } else if appState.lidDimmerEnabled {
                     Text("Turns display brightness to 0% when laptop lid is closed to save battery, restoring it when opened.")
                         .font(.caption)
                         .foregroundColor(.secondary)
@@ -141,20 +151,51 @@ struct MainView: View {
 
             Divider()
 
-            Button {
-                appState.toggleLaunchAtLogin()
-            } label: {
-                Text(appState.launchAtLoginEnabled ? "Disable Login Item" : "Enable Login Item")
-                    .frame(minWidth: 160)
+            HStack {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Launch at Login")
+                        .fontWeight(.medium)
+                    Text("Starts Sleep Disabler when you sign in.")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                }
+                Spacer()
+                Toggle("Launch at Login", isOn: Binding(
+                    get: { appState.launchAtLoginEnabled },
+                    set: { enabled in
+                        if enabled != appState.launchAtLoginEnabled {
+                            appState.toggleLaunchAtLogin()
+                        }
+                    }
+                ))
+                .labelsHidden()
             }
 
             Divider()
 
-            Button {
-                appState.toggleMode()
-            } label: {
-                Text(appState.menuBarMode ? "Switch to Window Mode" : "Switch to Menu Bar Mode")
-                    .frame(minWidth: 180)
+            HStack {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("App Mode")
+                        .fontWeight(.medium)
+                    Text(appState.menuBarMode ? "Runs from the menu bar." : "Shows the main window.")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                }
+                Spacer()
+                Picker("App Mode", selection: Binding(
+                    get: { appState.menuBarMode },
+                    set: { enabled in
+                        if enabled != appState.menuBarMode {
+                            appState.toggleMode()
+                        }
+                    }
+                )) {
+                    Text("Window").tag(false)
+                    Text("Menu Bar").tag(true)
+                }
+                .pickerStyle(.segmented)
+                .labelsHidden()
+                .frame(width: 156)
             }
 
             Spacer()

@@ -7,13 +7,32 @@ import SwiftUI
 import AppKit
 import ServiceManagement
 import Combine
+import Darwin
+import IOKit
+import IOKit.ps
 
-// C-Bridging for DisplayServices (Apple Silicon)
-@_silgen_name("DisplayServicesSetBrightness")
-func DisplayServicesSetBrightness(_ display: CGDirectDisplayID, _ brightness: Float) -> Int
+// DisplayServices is private, so resolve the optional brightness functions at
+// runtime. A missing symbol disables only the lid dimmer and never prevents the
+// Intel or Apple Silicon app from launching.
+private enum DisplayBrightness {
+    typealias Getter = @convention(c) (CGDirectDisplayID, UnsafeMutablePointer<Float>) -> Int32
+    typealias Setter = @convention(c) (CGDirectDisplayID, Float) -> Int32
 
-@_silgen_name("DisplayServicesGetBrightness")
-func DisplayServicesGetBrightness(_ display: CGDirectDisplayID, _ brightness: UnsafeMutablePointer<Float>) -> Int
+    private static let handle = dlopen(
+        "/System/Library/PrivateFrameworks/DisplayServices.framework/DisplayServices",
+        RTLD_LAZY
+    )
+
+    static let getBrightness: Getter? = handle.flatMap { handle in
+        dlsym(handle, "DisplayServicesGetBrightness").map { unsafeBitCast($0, to: Getter.self) }
+    }
+
+    static let setBrightness: Setter? = handle.flatMap { handle in
+        dlsym(handle, "DisplayServicesSetBrightness").map { unsafeBitCast($0, to: Setter.self) }
+    }
+
+    static var isAvailable: Bool { getBrightness != nil && setBrightness != nil }
+}
 
 @main
 struct SleepToggleApp: App {
@@ -43,37 +62,66 @@ struct WindowAccessor: NSViewRepresentable {
     var callback: (NSWindow) -> Void
 
     func makeNSView(context: Context) -> NSView {
-        let view = NSView()
-        DispatchQueue.main.async {
-            if let window = view.window {
-                callback(window)
-            }
-        }
-        return view
+        WindowObservationView(callback: callback)
     }
 
     func updateNSView(_ nsView: NSView, context: Context) {}
 }
 
+private final class WindowObservationView: NSView {
+    private let callback: (NSWindow) -> Void
+
+    init(callback: @escaping (NSWindow) -> Void) {
+        self.callback = callback
+        super.init(frame: .zero)
+    }
+
+    required init?(coder: NSCoder) { nil }
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        if let window { callback(window) }
+    }
+}
+
 // MARK: - APP STATE
 final class AppState: ObservableObject {
+    private static let preferencesApplicationID = "com.ych.sleepdisabler" as CFString
+    private static let lidDimmerPreferenceKey = "lidDimmerEnabled" as CFString
+
     @Published var isFullySleepDisabled = false
     @Published var launchAtLoginEnabled = false
+    @Published private(set) var supportsBatteryFailsafe = false
+    @Published private(set) var supportsLidDimmer = false
 
     @Published var menuBarMode = false {
         didSet { UserDefaults.standard.set(menuBarMode, forKey: "menuBarMode") }
     }
 
     @Published var failsafeEnabled = false {
-        didSet { UserDefaults.standard.set(failsafeEnabled, forKey: "failsafeEnabled") }
+        didSet {
+            UserDefaults.standard.set(failsafeEnabled, forKey: "failsafeEnabled")
+            if failsafeEnabled { checkBatteryFailsafe() }
+        }
     }
 
     @Published var failsafeThreshold: Int = 20 {
-        didSet { UserDefaults.standard.set(failsafeThreshold, forKey: "failsafeThreshold") }
+        didSet {
+            UserDefaults.standard.set(failsafeThreshold, forKey: "failsafeThreshold")
+            if failsafeEnabled { checkBatteryFailsafe() }
+        }
     }
 
     @Published var lidDimmerEnabled = false {
-        didSet { UserDefaults.standard.set(lidDimmerEnabled, forKey: "lidDimmerEnabled") }
+        didSet {
+            if lidDimmerEnabled && !supportsLidDimmer {
+                lidDimmerEnabled = false
+                return
+            }
+            Self.saveLidDimmerPreference(lidDimmerEnabled)
+            updateLidMonitoring()
+            checkLidState()
+        }
     }
 
     @Published var sleepTimerDays = 0 {
@@ -98,7 +146,10 @@ final class AppState: ObservableObject {
     }
 
     @Published var sleepTimerLidClosedOnly = false {
-        didSet { UserDefaults.standard.set(sleepTimerLidClosedOnly, forKey: "sleepTimerLidClosedOnly") }
+        didSet {
+            UserDefaults.standard.set(sleepTimerLidClosedOnly, forKey: "sleepTimerLidClosedOnly")
+            updateLidMonitoring()
+        }
     }
 
     @Published var sleepTimerSleepDisabledOnly = false {
@@ -111,7 +162,10 @@ final class AppState: ObservableObject {
     }
 
     @Published var sleepTimerRunning = false {
-        didSet { sleepTimerRunning ? startSleepTimer() : stopSleepTimer() }
+        didSet {
+            sleepTimerRunning ? startSleepTimer() : stopSleepTimer()
+            updateLidMonitoring()
+        }
     }
 
     @Published private(set) var sleepTimerRemaining: TimeInterval = 0
@@ -124,6 +178,12 @@ final class AppState: ObservableObject {
     private var originalBrightness: Float? = nil
     private var isCurrentlyDimmed = false
     private var lidCheckTimer: Timer?
+    private var lidRootDomain: io_service_t = IO_OBJECT_NULL
+    private var lidNotificationPort: IONotificationPortRef?
+    private var lidInterestNotification: io_object_t = IO_OBJECT_NULL
+    private var lidInterestSource: CFRunLoopSource?
+    private var workspaceObservers: [NSObjectProtocol] = []
+    private var batteryNotificationSource: CFRunLoopSource?
     private var sleepTimer: Timer?
     private var sleepTimerEndDate: Date?
     private weak var sleepSchedulerRemainingMenuItem: NSMenuItem?
@@ -154,16 +214,20 @@ final class AppState: ObservableObject {
         failsafeEnabled = UserDefaults.standard.object(forKey: "failsafeEnabled") as? Bool ?? false
         let threshold = UserDefaults.standard.integer(forKey: "failsafeThreshold")
         failsafeThreshold = threshold > 0 ? threshold : 20
-        lidDimmerEnabled = UserDefaults.standard.object(forKey: "lidDimmerEnabled") as? Bool ?? false
+        let savedLidDimmerEnabled = Self.loadLidDimmerPreference()
         sleepTimerDays = min(max(0, UserDefaults.standard.integer(forKey: "sleepTimerDays")), 365)
         sleepTimerHours = min(max(0, UserDefaults.standard.integer(forKey: "sleepTimerHours")), 23)
         let savedMinutes = UserDefaults.standard.object(forKey: "sleepTimerMinutes") as? Int
         sleepTimerMinutes = min(max(0, savedMinutes ?? 30), 59)
         sleepTimerLidClosedOnly = UserDefaults.standard.object(forKey: "sleepTimerLidClosedOnly") as? Bool ?? false
         sleepTimerSleepDisabledOnly = UserDefaults.standard.object(forKey: "sleepTimerSleepDisabledOnly") as? Bool ?? false
+        supportsLidDimmer = Self.isMacBook() && DisplayBrightness.isAvailable
+        lidDimmerEnabled = supportsLidDimmer && savedLidDimmerEnabled
 
         updateActivationPolicy()
         refreshAll()
+        installBatteryNotifications()
+        installLidNotifications()
 
         if menuBarMode {
             createMenuBar()
@@ -173,13 +237,65 @@ final class AppState: ObservableObject {
         }
 
         startRefreshTimer()
-        startLidCheckTimer()
+        updateLidMonitoring()
+    }
+
+    private static func loadLidDimmerPreference() -> Bool {
+        _ = CFPreferencesSynchronize(
+            preferencesApplicationID,
+            kCFPreferencesCurrentUser,
+            kCFPreferencesAnyHost
+        )
+        let value = CFPreferencesCopyValue(
+            lidDimmerPreferenceKey,
+            preferencesApplicationID,
+            kCFPreferencesCurrentUser,
+            kCFPreferencesAnyHost
+        )
+        return (value as? NSNumber)?.boolValue ?? false
+    }
+
+    private static func saveLidDimmerPreference(_ enabled: Bool) {
+        CFPreferencesSetValue(
+            lidDimmerPreferenceKey,
+            enabled ? kCFBooleanTrue : kCFBooleanFalse,
+            preferencesApplicationID,
+            kCFPreferencesCurrentUser,
+            kCFPreferencesAnyHost
+        )
+        _ = CFPreferencesSynchronize(
+            preferencesApplicationID,
+            kCFPreferencesCurrentUser,
+            kCFPreferencesAnyHost
+        )
+    }
+
+    deinit {
+        refreshTimer?.invalidate()
+        lidCheckTimer?.invalidate()
+        sleepTimer?.invalidate()
+        if let batteryNotificationSource {
+            CFRunLoopRemoveSource(CFRunLoopGetMain(), batteryNotificationSource, .commonModes)
+        }
+        workspaceObservers.forEach(NSWorkspace.shared.notificationCenter.removeObserver)
+        if lidInterestNotification != IO_OBJECT_NULL { IOObjectRelease(lidInterestNotification) }
+        if lidRootDomain != IO_OBJECT_NULL { IOObjectRelease(lidRootDomain) }
+        if let lidNotificationPort {
+            if let lidInterestSource {
+                CFRunLoopRemoveSource(CFRunLoopGetMain(), lidInterestSource, .commonModes)
+            }
+            IONotificationPortDestroy(lidNotificationPort)
+        }
     }
 
     func configureInitialWindow(_ window: NSWindow) {
         window.setContentSize(NSSize(width: 440, height: 620))
         if menuBarMode {
+            window.alphaValue = 0
+            window.animationBehavior = .none
             window.orderOut(nil)
+        } else {
+            window.alphaValue = 1
         }
     }
 
@@ -192,9 +308,19 @@ final class AppState: ObservableObject {
         }
     }
 
-    func startLidCheckTimer() {
-        lidCheckTimer = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] _ in
-            self?.checkLidState()
+    func updateLidMonitoring() {
+        let needsLidState = supportsLidDimmer
+            && (lidDimmerEnabled || (sleepTimerRunning && sleepTimerLidClosedOnly))
+        if needsLidState {
+            checkLidState()
+            guard lidCheckTimer == nil else { return }
+            lidCheckTimer = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] _ in
+                self?.checkLidState()
+            }
+        } else {
+            lidCheckTimer?.invalidate()
+            lidCheckTimer = nil
+            if isCurrentlyDimmed { restoreBrightness() }
         }
     }
 
@@ -226,6 +352,8 @@ final class AppState: ObservableObject {
         NSApplication.shared.activate(ignoringOtherApps: true)
 
         if let window = NSApplication.shared.windows.first(where: { $0.styleMask.contains(.titled) && $0 != notificationWindow }) {
+            window.alphaValue = 1
+            window.animationBehavior = .default
             if window.isMiniaturized {
                 window.deminiaturize(nil)
             }
@@ -266,6 +394,7 @@ final class AppState: ObservableObject {
             keyEquivalent: ""
         )
         dimmer.target = self
+        dimmer.isEnabled = supportsLidDimmer
         menu.addItem(dimmer)
         menu.addItem(.separator())
 
@@ -353,6 +482,7 @@ final class AppState: ObservableObject {
     @objc func toggleModeMenu() { toggleMode() }
     @objc func toggleLoginMenu() { toggleLaunchAtLogin() }
     @objc func toggleDimmerMenu() {
+        guard supportsLidDimmer else { return }
         lidDimmerEnabled.toggle()
         refreshMenuBar()
     }
@@ -488,27 +618,49 @@ final class AppState: ObservableObject {
 
     // MARK: - BATTERY FAILSAFE
     func checkBatteryFailsafe() {
-        guard failsafeEnabled, isFullySleepDisabled else { return }
+        let status = currentBatteryStatus()
+        supportsBatteryFailsafe = status.hasInternalBattery
+        guard failsafeEnabled, isFullySleepDisabled, status.isDrawingFromBattery,
+              let percentage = status.percentage, percentage < failsafeThreshold else { return }
+        triggerFailsafe()
+    }
 
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/usr/bin/pmset")
-        process.arguments = ["-g", "batt"]
-        let pipe = Pipe()
-        process.standardOutput = pipe
+    private func installBatteryNotifications() {
+        batteryNotificationSource = IOPSNotificationCreateRunLoopSource({ context in
+            guard let context else { return }
+            let appState = Unmanaged<AppState>.fromOpaque(context).takeUnretainedValue()
+            DispatchQueue.main.async { appState.checkBatteryFailsafe() }
+        }, Unmanaged.passUnretained(self).toOpaque())?.takeRetainedValue()
 
-        do {
-            try process.run()
-            process.waitUntilExit()
-            let output = String(decoding: pipe.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
+        if let batteryNotificationSource {
+            CFRunLoopAddSource(CFRunLoopGetMain(), batteryNotificationSource, .commonModes)
+        }
+        checkBatteryFailsafe()
+    }
 
-            let isDischarging = output.contains("Now drawing from 'Battery Power'")
-            if isDischarging, let match = output.range(of: #"(\d+)%"#, options: .regularExpression) {
-                let percStr = output[match].dropLast()
-                if let perc = Int(percStr), perc < failsafeThreshold {
-                    triggerFailsafe()
-                }
+    private func currentBatteryStatus() -> (hasInternalBattery: Bool, percentage: Int?, isDrawingFromBattery: Bool) {
+        guard let snapshot = IOPSCopyPowerSourcesInfo()?.takeRetainedValue(),
+              let sources = IOPSCopyPowerSourcesList(snapshot)?.takeRetainedValue() as? [CFTypeRef] else {
+            return (false, nil, false)
+        }
+
+        var percentage: Int?
+        var hasInternalBattery = false
+        for source in sources {
+            guard let description = IOPSGetPowerSourceDescription(snapshot, source)?.takeUnretainedValue() as? [String: Any],
+                  description[kIOPSTypeKey as String] as? String == (kIOPSInternalBatteryType as String) else {
+                continue
             }
-        } catch {}
+            hasInternalBattery = true
+            if let current = description[kIOPSCurrentCapacityKey as String] as? Int,
+               let maximum = description[kIOPSMaxCapacityKey as String] as? Int,
+               maximum > 0 {
+                percentage = min(100, max(0, Int((Double(current) / Double(maximum) * 100).rounded())))
+            }
+        }
+
+        let provider = IOPSGetProvidingPowerSourceType(snapshot).takeRetainedValue() as String
+        return (hasInternalBattery, percentage, provider == (kIOPSBatteryPowerValue as String))
     }
 
     func triggerFailsafe() {
@@ -541,7 +693,8 @@ final class AppState: ObservableObject {
 
     // MARK: - LID DIMMER
     func checkLidState() {
-        guard lidDimmerEnabled || (sleepTimerRunning && sleepTimerLidClosedOnly) else {
+        guard supportsLidDimmer,
+              lidDimmerEnabled || (sleepTimerRunning && sleepTimerLidClosedOnly) else {
             if isCurrentlyDimmed { restoreBrightness() }
             return
         }
@@ -565,30 +718,97 @@ final class AppState: ObservableObject {
     }
 
     private func isLidClosed() -> Bool {
-        let p = Process()
-        p.executableURL = URL(fileURLWithPath: "/usr/sbin/ioreg")
-        p.arguments = ["-r", "-k", "AppleClamshellState", "-d", "4"]
-        let pipe = Pipe()
-        p.standardOutput = pipe
-        try? p.run()
-        p.waitUntilExit()
-        let out = String(decoding: pipe.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
-        return out.contains("\"AppleClamshellState\" = Yes")
+        guard lidRootDomain != IO_OBJECT_NULL,
+              let value = IORegistryEntryCreateCFProperty(
+                lidRootDomain,
+                "AppleClamshellState" as CFString,
+                kCFAllocatorDefault,
+                0
+              )?.takeRetainedValue() else { return false }
+        if let bool = value as? Bool { return bool }
+        return (value as? NSNumber)?.boolValue ?? false
+    }
+
+    private func installLidNotifications() {
+        lidRootDomain = IOServiceGetMatchingService(
+            kIOMainPortDefault,
+            IOServiceMatching("IOPMrootDomain")
+        )
+        guard lidRootDomain != IO_OBJECT_NULL else { return }
+
+        let port = IONotificationPortCreate(kIOMainPortDefault)
+        var notification: io_object_t = IO_OBJECT_NULL
+        let result = IOServiceAddInterestNotification(
+            port,
+            lidRootDomain,
+            kIOGeneralInterest,
+            { context, _, _, _ in
+                guard let context else { return }
+                let appState = Unmanaged<AppState>.fromOpaque(context).takeUnretainedValue()
+                DispatchQueue.main.async { appState.checkLidState() }
+            },
+            Unmanaged.passUnretained(self).toOpaque(),
+            &notification
+        )
+
+        if result == KERN_SUCCESS {
+            lidNotificationPort = port
+            lidInterestNotification = notification
+            lidInterestSource = IONotificationPortGetRunLoopSource(port).takeUnretainedValue()
+            if let lidInterestSource {
+                CFRunLoopAddSource(CFRunLoopGetMain(), lidInterestSource, .commonModes)
+            }
+        } else {
+            IONotificationPortDestroy(port)
+        }
+
+        let center = NSWorkspace.shared.notificationCenter
+        for name in [NSWorkspace.didWakeNotification, NSWorkspace.willSleepNotification] {
+            workspaceObservers.append(
+                center.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in
+                    self?.checkLidState()
+                }
+            )
+        }
+    }
+
+    private static func isMacBook() -> Bool {
+        let process = Process()
+        let output = Pipe()
+        process.executableURL = URL(fileURLWithPath: "/usr/sbin/system_profiler")
+        process.arguments = ["SPHardwareDataType", "-json"]
+        process.standardOutput = output
+        do {
+            try process.run()
+            process.waitUntilExit()
+            guard process.terminationStatus == 0,
+                  let report = try JSONSerialization.jsonObject(
+                    with: output.fileHandleForReading.readDataToEndOfFile()
+                  ) as? [String: Any],
+                  let hardware = report["SPHardwareDataType"] as? [[String: Any]],
+                  let modelName = hardware.first?["machine_name"] as? String else { return false }
+            return modelName.range(of: "MacBook", options: .caseInsensitive) != nil
+        } catch {
+            return false
+        }
     }
 
     func dimBrightness() {
+        guard supportsLidDimmer, let getBrightness = DisplayBrightness.getBrightness,
+              let setBrightness = DisplayBrightness.setBrightness else { return }
         let display = CGMainDisplayID()
         var current: Float = 0
-        _ = DisplayServicesGetBrightness(display, &current)
+        guard getBrightness(display, &current) == 0 else { return }
+        guard setBrightness(display, 0.0) == 0 else { return }
         originalBrightness = current
-        _ = DisplayServicesSetBrightness(display, 0.0)
         isCurrentlyDimmed = true
     }
 
     func restoreBrightness() {
-        if let orig = originalBrightness {
-            _ = DisplayServicesSetBrightness(CGMainDisplayID(), orig)
+        if let orig = originalBrightness, let setBrightness = DisplayBrightness.setBrightness {
+            _ = setBrightness(CGMainDisplayID(), orig)
         }
+        originalBrightness = nil
         isCurrentlyDimmed = false
     }
 
@@ -678,6 +898,10 @@ final class AppState: ObservableObject {
 
     // MARK: - COMMAND EXECUTION
     func runCommand(_ args: [String]) {
+        guard isAllowedPmsetCommand(args) else {
+            print("Blocked unexpected pmset arguments: \(args)")
+            return
+        }
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/usr/bin/sudo")
         process.arguments = ["-n", "/usr/bin/pmset"] + args
@@ -688,17 +912,48 @@ final class AppState: ObservableObject {
             print("runCommand error: \(error)")
         }
     }
+
+    private func isAllowedPmsetCommand(_ args: [String]) -> Bool {
+        let fixedCommands = [
+            ["sleepnow"],
+            ["-a", "disablesleep", "0"],
+            ["-a", "disablesleep", "1"],
+            ["-a", "sleep", "0"],
+            ["-a", "displaysleep", "0"]
+        ]
+        if fixedCommands.contains(args) { return true }
+        guard args.count == 3,
+              ["-b", "-c"].contains(args[0]),
+              ["sleep", "displaysleep"].contains(args[1]),
+              let value = Int(args[2]) else { return false }
+        return (0...180).contains(value)
+    }
 }
 
 // MARK: - APP DELEGATE
+private enum PmsetPermissionStatus {
+    case restricted
+    case legacyBroad
+    case missing
+}
+
 final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     weak var mainWindow: NSWindow?
     weak var appState: AppState?
+
+    func applicationWillFinishLaunching(_ notification: Notification) {
+        let startsInMenuBarMode = UserDefaults.standard.object(forKey: "menuBarMode") as? Bool ?? false
+        NSApp.setActivationPolicy(startsInMenuBarMode ? .accessory : .regular)
+    }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         DispatchQueue.main.async {
             self.checkPmsetPermission()
         }
+    }
+
+    func applicationWillTerminate(_ notification: Notification) {
+        appState?.restoreBrightness()
     }
 
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
@@ -714,38 +969,107 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
 
     func checkPmsetPermission() {
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/usr/bin/sudo")
-        process.arguments = ["-n", "/usr/bin/pmset", "-g"]
-        do {
-            try process.run()
-            process.waitUntilExit()
-            if process.terminationStatus == 0 { return }
-        } catch { }
-        promptForSudoersInstall()
-    }
+        let status = pmsetPermissionStatus()
+        guard status != .restricted else { return }
 
-    func promptForSudoersInstall() {
-        let alert = NSAlert()
-        alert.messageText = "Permission Required"
-        alert.informativeText = "Install pmset permission rule?"
-        alert.addButton(withTitle: "Enable")
-        alert.addButton(withTitle: "Cancel")
-        if alert.runModal() == .alertFirstButtonReturn {
-            installSudoers()
+        let explanation = NSAlert()
+        explanation.messageText = status == .legacyBroad
+            ? "Update Sleep Control Permission"
+            : "Install Sleep Control Permission"
+        explanation.informativeText = status == .legacyBroad
+            ? "Sleep Disabler found its older unrestricted pmset rule. It needs one administrator approval to replace that file with a safer rule limited to the exact sleep commands used by this app. Your password is handled by macOS and is never seen or stored by Sleep Disabler."
+            : "Sleep Disabler needs one administrator approval to install a restricted permission file in /etc/sudoers.d. It permits only the exact sleep commands used by this app. Your password is handled by macOS and is never seen or stored by Sleep Disabler."
+        explanation.addButton(withTitle: status == .legacyBroad ? "Update Permission" : "Install Permission")
+        explanation.addButton(withTitle: "Not Now")
+        guard explanation.runModal() == .alertFirstButtonReturn else { return }
+
+        let installation = installRestrictedPmsetPermission()
+        guard installation.succeeded, pmsetPermissionStatus() == .restricted else {
+            let alert = NSAlert()
+            alert.messageText = "Sleep Control Permission Was Not Installed"
+            alert.informativeText = installation.errorMessage
+                ?? "The installer completed, but the restricted permission could not be verified. The existing permission file was left unchanged."
+            alert.runModal()
+            return
         }
     }
 
-    func installSudoers() {
-        let temp = "/tmp/sleep_disabler"
-        let content = "%admin ALL=(ALL) NOPASSWD: /usr/bin/pmset\n"
-        try? content.write(toFile: temp, atomically: true, encoding: .utf8)
-        let cmd = "sudo mkdir -p /etc/sudoers.d && sudo cp \(temp) /etc/sudoers.d/sleep_disabler && sudo chmod 440 /etc/sudoers.d/sleep_disabler"
-        let p = Process()
-        p.executableURL = URL(fileURLWithPath: "/bin/zsh")
-        p.arguments = ["-c", cmd]
-        try? p.run()
-        p.waitUntilExit()
-        try? FileManager.default.removeItem(atPath: temp)
+    private func pmsetPermissionStatus() -> PmsetPermissionStatus {
+        let process = Process()
+        let output = Pipe()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/sudo")
+        process.arguments = ["-n", "-ll"]
+        process.standardOutput = output
+        process.standardError = FileHandle.nullDevice
+        do {
+            try process.run()
+            let data = output.fileHandleForReading.readDataToEndOfFile()
+            process.waitUntilExit()
+            guard process.terminationStatus == 0 else { return .missing }
+            let listing = String(decoding: data, as: UTF8.self)
+            let entries = listing.components(separatedBy: "Sudoers entry:")
+            let noPasswordEntries = entries.filter { $0.contains("Options: !authenticate") }
+            let legacyPattern = #"(?m)^\s*/usr/bin/pmset\s*$"#
+            if noPasswordEntries.contains(where: {
+                $0.range(of: legacyPattern, options: .regularExpression) != nil
+            }) { return .legacyBroad }
+
+            let requiredRuleFragments = [
+                "/usr/bin/pmset ^-a disablesleep [01]$",
+                "/usr/bin/pmset ^-a sleep 0$",
+                "/usr/bin/pmset ^-a displaysleep 0$",
+                "/usr/bin/pmset ^-[bc] (sleep|displaysleep) (0|[1-9][0-9]?|1[0-7][0-9]|180)$",
+                "/usr/bin/pmset ^sleepnow$"
+            ]
+            let hasRestrictedRules = requiredRuleFragments.allSatisfy { fragment in
+                noPasswordEntries.contains(where: { $0.contains(fragment) })
+            }
+            return hasRestrictedRules ? .restricted : .missing
+        } catch {
+            return .missing
+        }
+    }
+
+    private func installRestrictedPmsetPermission() -> (succeeded: Bool, errorMessage: String?) {
+        let temporaryURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("sleep_disabler_sudoers_\(UUID().uuidString)")
+        let rule = """
+        # Sleep Disabler restricted pmset policy v2
+        # Generated by Sleep Disabler; do not edit this file.
+        %admin ALL=(root) NOPASSWD: /usr/bin/pmset ^-a disablesleep [01]$, /usr/bin/pmset ^-a sleep 0$, /usr/bin/pmset ^-a displaysleep 0$, /usr/bin/pmset ^-[bc] (sleep|displaysleep) (0|[1-9][0-9]?|1[0-7][0-9]|180)$, /usr/bin/pmset ^sleepnow$
+        """
+        do {
+            try rule.write(to: temporaryURL, atomically: true, encoding: .utf8)
+        } catch {
+            return (false, "Sleep Disabler could not create its temporary permission file: \(error.localizedDescription)")
+        }
+        defer { try? FileManager.default.removeItem(at: temporaryURL) }
+
+        let source = shellQuoted(temporaryURL.path)
+        let destination = shellQuoted("/etc/sudoers.d/sleep_disabler")
+        let staging = shellQuoted("/etc/sudoers.d/sleep_disabler.new")
+        let recognizedFile = "(/usr/bin/grep -Fqx '# Sleep Disabler restricted pmset policy v2' \(destination) || /usr/bin/grep -Fqx '%admin ALL=(ALL) NOPASSWD: /usr/bin/pmset' \(destination))"
+        let protectUnknownFile = "if [ -e \(destination) ]; then \(recognizedFile) || { /bin/echo 'The existing sleep_disabler permission file is not recognized and was not overwritten.' >&2; exit 42; }; fi"
+        let command = "\(protectUnknownFile) && /bin/mkdir -p /etc/sudoers.d && /usr/sbin/visudo -cf \(source) && /usr/bin/install -o root -g wheel -m 440 \(source) \(staging) && /usr/sbin/visudo -cf \(staging) && /bin/mv -f \(staging) \(destination)"
+        let script = "do shell script \(appleScriptQuoted(command)) with administrator privileges"
+        var error: NSDictionary?
+        let result = NSAppleScript(source: script)?.executeAndReturnError(&error)
+        guard result != nil, error == nil else {
+            let message = error?["NSAppleScriptErrorMessage"] as? String
+                ?? error?["NSAppleScriptErrorBriefMessage"] as? String
+                ?? "macOS did not complete the administrator-authorized installation."
+            let number = error?["NSAppleScriptErrorNumber"] as? Int
+            let detail = number.map { "\(message) (error \($0))" } ?? message
+            return (false, detail)
+        }
+        return (true, nil)
+    }
+
+    private func shellQuoted(_ value: String) -> String {
+        "'\(value.replacingOccurrences(of: "'", with: "'\\\"'\\\"'"))'"
+    }
+
+    private func appleScriptQuoted(_ value: String) -> String {
+        "\"\(value.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "\"", with: "\\\""))\""
     }
 }

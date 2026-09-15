@@ -14,6 +14,7 @@ Ram usage: 27.6 MB with all functions turned on.
 - Optionally launch when you log in.
 - Show the current state with a menu bar icon.
 - Check the power settings regularly so the displayed state stays up to date.
+- Read battery percentage and the active power source through IOKit instead of parsing `pmset` text.
 - **Dynamic State Saving**: Remembers exactly what your Mac's sleep settings were before disabling sleep, and perfectly restores them when re-enabled.
 - **Battery Failsafe**: Let's you set a custom battery percentage (like 5%). If the battery drops below this while sleep is disabled, the app saves your Mac by forcing it to sleep and dropping a notification window.
 - **Lid-Closed Dimmer**: When sleep is disabled, you can close your MacBook lid to drop the screen brightness completely to 0 (so it doesn't glow or waste power) while still keeping the Mac wide awake. Opening the lid brings your brightness right back!
@@ -22,26 +23,26 @@ Ram usage: 27.6 MB with all functions turned on.
 ## Requirements
 
 - macOS 13.5 or newer
-- Apple Silicon Mac (M1 chip or newer)
-- Xcode/Xcode Command Line Tools (for building from source)
+- Apple Silicon or Intel Mac
+- Xcode Command Line Tools (for building from source)
 
 ## Install
 
-Download the latest `Sleep Disabler.zip` from the Releases page, then extract it and move it to your Applications folder.
+Download `Sleep-Disabler-arm64.zip` for Apple Silicon or `Sleep-Disabler-x86_64.zip` for Intel. Each archive contains a separate native `.app`; neither is a universal binary.
 
 On the first launch, the app opens in Window Mode. This makes it easier to find, especially on MacBook Pro where a menu bar icon could be hidden near the camera notch.
 
 ## Permissions
 
-Sleep Disabler uses macOS's `pmset` command to change power settings. Running `pmset` requires administrator permission.
+Sleep Disabler uses macOS's `pmset` command to change power settings. Its state-changing commands require administrator permission.
 
-The app checks for a password-free permission rule when it starts. If the rule is missing, it asks whether you want to install the rule. Choosing **Enable** creates `/etc/sudoers.d/sleep_disabler` with:
+At startup, the app verifies its restricted password-free permission with a read-only `sudo -ll` policy listing. If the rule is missing or the app's older unrestricted rule is present, it explains why administrator authorization is needed before macOS requests the password. It validates the replacement with `visudo`, never reads or stores the password, and refuses to overwrite an unrecognized file.
 
 ```text
-%admin ALL=(ALL) NOPASSWD: /usr/bin/pmset
+%admin ALL=(root) NOPASSWD: /usr/bin/pmset ^-a disablesleep [01]$, /usr/bin/pmset ^-a sleep 0$, /usr/bin/pmset ^-a displaysleep 0$, /usr/bin/pmset ^-[bc] (sleep|displaysleep) (0|[1-9][0-9]?|1[0-7][0-9]|180)$, /usr/bin/pmset ^sleepnow$
 ```
 
-This lets the app run the required `pmset` commands without asking for your password every time. If you do not want the app to install the rule automatically, choose **Cancel** and set it up manually as below.
+This permits only the exact disable, restore, and immediate-sleep operations used by the app. macOS may request administrator authorization when installing or replacing the protected file; the old broad `pmset` rule cannot itself authorize that file change.
 
 ### Manual setup
 
@@ -51,10 +52,10 @@ Open Terminal and run:
 sudo EDITOR=nano visudo -f /etc/sudoers.d/sleep_disabler
 ```
 
-Add this line:
+Add this exact line:
 
 ```text
-%admin ALL=(ALL) NOPASSWD: /usr/bin/pmset
+%admin ALL=(root) NOPASSWD: /usr/bin/pmset ^-a disablesleep [01]$, /usr/bin/pmset ^-a sleep 0$, /usr/bin/pmset ^-a displaysleep 0$, /usr/bin/pmset ^-[bc] (sleep|displaysleep) (0|[1-9][0-9]?|1[0-7][0-9]|180)$, /usr/bin/pmset ^sleepnow$
 ```
 
 Save the file in Nano with `Control + O`, press `Enter`, then exit with `Control + X`.
@@ -65,16 +66,11 @@ Finally, set the file permissions:
 sudo chmod 440 /etc/sudoers.d/sleep_disabler
 ```
 
-Only add a `sudoers` rule if you understand what it does. If you want to remove it, delete `/etc/sudoers.d/sleep_disabler` using a method you are comfortable with that has administrator access, e.g. the rm command with sudo.
+Only add a `sudoers` rule if you understand what it does. If you want to remove it, use an administrator-authorized file-management method you are comfortable with.
 
 ## Building from source
 
-1. Open `Sleep Disabler.xcodeproj` in Xcode.
-2. Select the **Sleep Disabler** target.
-3. Choose your Mac as the run destination.
-4. Build and run with `Command + R`.
-
-*(If you don't have the full Xcode app installed and want to build directly from Terminal using Command Line Tools, check out [compile.md](compile.md) for the full guide!)*
+From the project root, run `zsh Scripts/archive-native.sh` without `sudo`. The script uses only Xcode Command Line Tools and creates separate Apple Silicon and Intel apps. See [RELEASE.md](RELEASE.md) and [compile.md](compile.md).
 
 The deployment target is macOS 13.5+ by project default.
 
@@ -98,7 +94,9 @@ sudo pmset -c sleep <saved_ac_sleep>
 sudo pmset -c displaysleep <saved_ac_displaysleep>
 ```
 
-For the **Lid-Closed Dimmer**, the app polls your MacBook's `AppleClamshellState` using `ioreg`. When it detects the lid is closed, it hooks directly into macOS's private `DisplayServices` framework (which is why it needs Apple Silicon) to drop the brightness exactly to 0 without actually triggering a system sleep event! 
+For the **Battery Failsafe**, the app uses IOKit Power Sources values and change notifications. It checks the system's current power provider separately, so charging or AC operation cannot be mistaken for battery discharge.
+
+For the **Lid-Closed Dimmer**, the app reads `AppleClamshellState` directly through IOKit and listens for general IOKit and workspace power events. Apple does not expose a supported lid-specific event API, so a direct IOKit fallback check runs only while a lid-dependent feature is active. The control is greyed out unless the Apple-reported model name contains `MacBook` and brightness control is available.
 
 The **Sleep Scheduler** uses the selected days, hours, and minutes as a countdown and then runs `pmset sleepnow`. Its saved values are restored at launch, so the menu-bar quick start always uses the last configured schedule. While a schedule is active, the menu displays the live remaining time. The optional closed-lid condition prevents starting while the lid is open and cancels the schedule if the lid opens. The optional sleep-disabled condition only permits a schedule while Sleep Disabler is active, and cancels it when normal sleep is restored.
 
