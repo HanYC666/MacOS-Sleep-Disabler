@@ -2,6 +2,20 @@
 
 All notable changes to Sleep Disabler are documented here. Versions without an existing Git tag are chronological patch versions inferred from the commit history.
 
+## [2026-09-15] - 1.4.2
+
+### Changed
+
+- Updated the separate single-architecture Apple Silicon and Intel release archives to build exclusively with Xcode Command Line Tools.
+- Added startup detection and automatic migration of the recognized legacy app-managed `pmset` permission rule.
+
+### Fixed
+
+- Preserved the proven `v1.3.0` sleep-button route so disabling sleep no longer depends on capturing both active and inactive power-source sections.
+- Fixed restricted-permission verification after administrator authorization and added an explanation before the macOS password prompt.
+- Prevented the main window from briefly appearing at launch when Menu Bar mode was saved.
+- Persisted the Lid-Closed Dimmer setting to the preferences file immediately and restored its boolean value at startup.
+
 ## [2026-09-14] - 1.4.1
 
 ### Added

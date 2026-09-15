@@ -77,10 +77,7 @@ struct MainView: View {
                     Text("Available when this Mac has an internal battery.")
                         .font(.caption)
                         .foregroundColor(.secondary)
-                        .accessibilityLabel("Battery Power Failsafe is available when this Mac has an internal battery")
-                }
-
-                if appState.failsafeEnabled && appState.supportsBatteryFailsafe {
+                } else if appState.failsafeEnabled {
                     Text("Restores sleep settings and puts the Mac to sleep if battery percentage falls below this value.")
                         .font(.caption)
                         .foregroundColor(.secondary)
@@ -143,10 +140,7 @@ struct MainView: View {
                     Text("Available on MacBooks only.")
                         .font(.caption)
                         .foregroundColor(.secondary)
-                        .accessibilityLabel("Lid-Closed Dimmer is available on MacBooks only")
-                }
-
-                if appState.lidDimmerEnabled && appState.supportsLidDimmer {
+                } else if appState.lidDimmerEnabled {
                     Text("Turns display brightness to 0% when laptop lid is closed to save battery, restoring it when opened.")
                         .font(.caption)
                         .foregroundColor(.secondary)
@@ -157,44 +151,52 @@ struct MainView: View {
 
             Divider()
 
-            VStack(spacing: 10) {
-                HStack(alignment: .firstTextBaseline) {
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text("Launch at Login")
-                            .fontWeight(.medium)
-                        Text("Starts Sleep Disabler when you sign in.")
-                            .font(.caption)
-                            .foregroundColor(.secondary)
-                    }
-                    Spacer()
-                    Toggle("Launch at Login", isOn: Binding(
-                        get: { appState.launchAtLoginEnabled },
-                        set: { appState.setLaunchAtLogin($0) }
-                    ))
-                    .labelsHidden()
-                    .accessibilityLabel("Launch at Login")
+            HStack {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Launch at Login")
+                        .fontWeight(.medium)
+                    Text("Starts Sleep Disabler when you sign in.")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
                 }
-
-                HStack(alignment: .firstTextBaseline) {
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text("App Mode")
-                            .fontWeight(.medium)
-                        Text(appState.menuBarMode ? "Menu Bar mode hides the main window." : "Window mode shows the main window.")
-                            .font(.caption)
-                            .foregroundColor(.secondary)
+                Spacer()
+                Toggle("Launch at Login", isOn: Binding(
+                    get: { appState.launchAtLoginEnabled },
+                    set: { enabled in
+                        if enabled != appState.launchAtLoginEnabled {
+                            appState.toggleLaunchAtLogin()
+                        }
                     }
-                    Picker("App Mode", selection: $appState.menuBarMode) {
-                        Text("Window").tag(false)
-                        Text("Menu Bar").tag(true)
-                    }
-                    .pickerStyle(.segmented)
-                    .frame(width: 156)
-                    .accessibilityLabel("App Mode")
-                }
+                ))
+                .labelsHidden()
             }
-            .padding(10)
-            .background(Color(nsColor: .controlBackgroundColor).opacity(0.55))
-            .clipShape(RoundedRectangle(cornerRadius: 7))
+
+            Divider()
+
+            HStack {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("App Mode")
+                        .fontWeight(.medium)
+                    Text(appState.menuBarMode ? "Runs from the menu bar." : "Shows the main window.")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                }
+                Spacer()
+                Picker("App Mode", selection: Binding(
+                    get: { appState.menuBarMode },
+                    set: { enabled in
+                        if enabled != appState.menuBarMode {
+                            appState.toggleMode()
+                        }
+                    }
+                )) {
+                    Text("Window").tag(false)
+                    Text("Menu Bar").tag(true)
+                }
+                .pickerStyle(.segmented)
+                .labelsHidden()
+                .frame(width: 156)
+            }
 
             Spacer()
         }
