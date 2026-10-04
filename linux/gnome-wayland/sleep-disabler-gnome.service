@@ -1,0 +1,15 @@
+[Unit]
+Description=Sleep Disabler GNOME Wayland prototype
+PartOf=graphical-session.target
+After=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 %h/.local/lib/sleep-disabler-gnome/agent.py
+Restart=on-failure
+RestartSec=3
+TimeoutStopSec=5
+CollectMode=inactive-or-failed
+
+[Install]
+WantedBy=graphical-session.target
