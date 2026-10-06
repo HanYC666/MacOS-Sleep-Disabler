@@ -42,6 +42,7 @@ def main():
     timer.add_argument("--prevention-on", action="store_true")
     sub.add_parser("cancel-timer")
     args = parser.parse_args()
+    app = None
     try:
         bus = dbus.SessionBus()
         app = dbus.Interface(bus.get_object(APP, PATH), IFACE)
@@ -67,6 +68,11 @@ def main():
             print(json.dumps(native(app.GetState()), indent=2, sort_keys=True))
     except dbus.DBusException as error:
         print(f"Sleep Disabler: {error}", file=sys.stderr)
+        if app is not None:
+            try:
+                print(json.dumps(native(app.GetState()), indent=2, sort_keys=True))
+            except dbus.DBusException:
+                pass
         return 1
     return 0
 

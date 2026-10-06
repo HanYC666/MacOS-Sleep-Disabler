@@ -25,7 +25,9 @@ export default class SleepDisablerExtension extends Extension {
         this._signal = 0;
         this._timerSignal = 0;
         this._state = null;
+        this._actionError = '';
         this._updating = false;
+        this._generation = 0;
         this._cancellable = new Gio.Cancellable();
 
         this._button = new PanelMenu.Button(0.0, 'Sleep Disabler', false);
@@ -89,15 +91,21 @@ export default class SleepDisablerExtension extends Extension {
     _connected(connection) {
         if (!this._button)
             return;
+        this._generation++;
         if (this._bus && this._signal)
             this._bus.signal_unsubscribe(this._signal);
         if (this._bus && this._timerSignal)
             this._bus.signal_unsubscribe(this._timerSignal);
         this._bus = connection;
+        this._state = null;
+        this._actionError = '';
+        const generation = this._generation;
         this._signal = connection.signal_subscribe(
             APP, IFACE, 'StateChanged', PATH, null,
             Gio.DBusSignalFlags.NONE,
             (_bus, _sender, _path, _iface, _signal, parameters) => {
+                if (!this._button || generation !== this._generation)
+                    return;
                 const [state] = parameters.deep_unpack();
                 this._render(state);
             }
@@ -106,29 +114,39 @@ export default class SleepDisablerExtension extends Extension {
             APP, IFACE, 'TimerChanged', PATH, null,
             Gio.DBusSignalFlags.NONE,
             (_bus, _sender, _path, _iface, _signal, parameters) => {
-                if (!this._state)
+                if (!this._button || generation !== this._generation || !this._state)
                     return;
                 const [remaining] = parameters.deep_unpack();
                 this._state.timerRemaining = new GLib.Variant('t', remaining);
                 this._render(this._state);
             }
         );
-        this._setConnected(true);
+        this._setConnected(false);
+        this._status.label.text = 'Connecting…';
+        this._refresh();
+    }
+
+    _refresh() {
+        if (!this._bus || !this._button)
+            return;
+        const generation = this._generation;
         this._bus.call(APP, PATH, IFACE, 'GetState', new GLib.Variant('()'),
             new GLib.VariantType('(a{sv})'), Gio.DBusCallFlags.NONE, 5000,
             this._cancellable, (bus, result) => {
-                if (!this._button)
+                if (!this._button || generation !== this._generation)
                     return;
                 try {
                     const [state] = bus.call_finish(result).deep_unpack();
                     this._render(state);
                 } catch (error) {
+                    this._setConnected(false);
                     this._showError(error);
                 }
             });
     }
 
     _disconnected() {
+        this._generation++;
         if (this._bus && this._signal)
             this._bus.signal_unsubscribe(this._signal);
         if (this._bus && this._timerSignal)
@@ -137,6 +155,7 @@ export default class SleepDisablerExtension extends Extension {
         this._signal = 0;
         this._timerSignal = 0;
         this._state = null;
+        this._actionError = '';
         this._setConnected(false);
     }
 
@@ -155,52 +174,80 @@ export default class SleepDisablerExtension extends Extension {
         this._state = state;
         const on = Boolean(value(state, 'enabled', false));
         const desired = Boolean(value(state, 'desired', false));
+        const releasePending = Boolean(value(state, 'gnomeReleasePending', false));
         const error = String(value(state, 'error', ''));
         const remaining = Number(value(state, 'timerRemaining', 0));
         const battery = Number(value(state, 'batteryPercent', -1));
-        const parts = [on ? 'Prevention on' : desired ? 'Reconnecting…' : 'Prevention off'];
+        const parts = [releasePending ? 'Prevention release pending' :
+            on ? 'Prevention on' : desired ? 'Reconnecting…' : 'Prevention off'];
         if (remaining > 0)
             parts.push(`sleep in ${Math.ceil(remaining / 60)} min`);
         if (battery >= 0)
             parts.push(`battery ${Math.round(battery)}%`);
         if (error)
             parts.push(error);
+        if (this._actionError)
+            parts.push(this._actionError);
+        const lidRequested = Boolean(value(state, 'lidRequested', false));
+        const lidAcquired = Boolean(value(state, 'lidLockAcquired', false));
+        const lidOutcome = String(value(state, 'lidOutcome', 'unverified'));
+        if (lidRequested)
+            parts.push(lidAcquired ? `lid lock acquired (${lidOutcome})` : `lid lock missing (${lidOutcome})`);
+        const brightnessError = String(value(state, 'brightnessError', ''));
+        if (Boolean(value(state, 'brightnessRecoveryPending', false)))
+            parts.push('brightness recovery pending');
+        else if (brightnessError && Boolean(value(state, 'lidDimming', false)))
+            parts.push(brightnessError);
+        const timerOutcome = String(value(state, 'timerOutcome', ''));
+        if (timerOutcome)
+            parts.push(timerOutcome);
         this._status.label.text = parts.join(' · ');
-        this._icon.icon_name = desired && !on ? 'dialog-warning-symbolic' :
+        this._icon.icon_name = releasePending || desired && !on ? 'dialog-warning-symbolic' :
             on ? 'media-playback-pause-symbolic' : 'weather-clear-night-symbolic';
         this._updating = true;
         this._prevention.setToggleState(on);
-        this._lid.setToggleState(Boolean(value(state, 'lidMode', false)));
+        this._lid.setToggleState(lidRequested);
         this._dimming.setToggleState(Boolean(value(state, 'lidDimming', false)));
         this._failsafe.setToggleState(Boolean(value(state, 'failsafe', false)));
         this._updating = false;
-        this._dimming.setSensitive(Boolean(value(state, 'brightnessAvailable', false)));
+        for (const item of [this._prevention, this._lid, this._failsafe, ...this._timerItems])
+            item.setSensitive(true);
+        this._prevention.setSensitive(!releasePending);
+        this._dimming.setSensitive(Boolean(value(state, 'brightnessAvailable', false)) ||
+            Boolean(value(state, 'lidDimming', false)));
         this._cancel.setSensitive(remaining > 0);
     }
 
     _call(method, parameters) {
         if (!this._bus || !this._button)
             return;
+        const generation = this._generation;
         this._bus.call(APP, PATH, IFACE, method, parameters, null,
             Gio.DBusCallFlags.NONE, 10000, this._cancellable, (bus, result) => {
-                if (!this._button)
+                if (!this._button || generation !== this._generation)
                     return;
                 try {
                     bus.call_finish(result);
+                    this._actionError = '';
+                    this._refresh();
                 } catch (error) {
                     this._showError(error);
                     // A rejected toggle should return to the authoritative state.
-                    this._connected(this._bus);
+                    this._refresh();
                 }
             });
     }
 
     _showError(error) {
-        if (this._status)
-            this._status.label.text = `Sleep Disabler error: ${error.message}`;
+        this._actionError = `Sleep Disabler error: ${error.message}`;
+        if (this._state)
+            this._render(this._state);
+        else if (this._status)
+            this._status.label.text = this._actionError;
     }
 
     disable() {
+        this._generation++;
         this._cancellable?.cancel();
         if (this._watch)
             Gio.bus_unwatch_name(this._watch);
@@ -212,6 +259,7 @@ export default class SleepDisablerExtension extends Extension {
         this._button = null;
         this._bus = null;
         this._state = null;
+        this._actionError = '';
         this._cancellable = null;
         this._watch = 0;
         this._signal = 0;

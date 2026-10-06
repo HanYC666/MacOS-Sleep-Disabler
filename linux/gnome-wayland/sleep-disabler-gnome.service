@@ -8,7 +8,7 @@ Type=simple
 ExecStart=/usr/bin/python3 %h/.local/lib/sleep-disabler-gnome/agent.py
 Restart=on-failure
 RestartSec=3
-TimeoutStopSec=5
+TimeoutStopSec=30
 CollectMode=inactive-or-failed
 
 [Install]

@@ -20,11 +20,6 @@ if ! /usr/bin/python3 -c 'import dbus, gi' >/dev/null 2>&1; then
     printf '%s\n' 'Install dependencies first: sudo apt install python3-dbus python3-gi' >&2
     exit 1
 fi
-if ! command -v gnome-extensions >/dev/null 2>&1; then
-    printf '%s\n' 'GNOME extension tools are missing (install gnome-shell-extension-prefs or your distro equivalent).' >&2
-    exit 1
-fi
-
 install -d "$program_target" "$extension_target" "$unit_target" "$bin_target"
 install -m 644 "$base_dir/agent.py" "$program_target/agent.py"
 install -m 644 "$base_dir/ctl.py" "$program_target/ctl.py"
@@ -39,13 +34,60 @@ EOF
 chmod 755 "$bin_target/sleep-disablerctl"
 
 systemctl --user daemon-reload
-systemctl --user enable --now sleep-disabler-gnome.service
+systemctl --user enable sleep-disabler-gnome.service
 systemctl --user restart sleep-disabler-gnome.service
-if ! gnome-extensions enable "$extension_id"; then
-    printf '%s\n' 'Extension copied, but GNOME has not discovered it yet. Log out and back in, then run:' >&2
-    printf 'gnome-extensions enable %s\n' "$extension_id" >&2
+if ! systemctl --user is-active --quiet sleep-disabler-gnome.service; then
+    printf '%s\n' 'Sleep Disabler agent did not start; inspect systemctl --user status sleep-disabler-gnome.service.' >&2
+    exit 1
 fi
-
-printf '%s\n' 'Installed. Prevention starts OFF. Open the top-bar menu or run:'
-printf '%s\n' "  $bin_target/sleep-disablerctl status"
-printf '%s\n' 'If the top-bar item is absent, log out and back in once.'
+if ! /usr/bin/python3 "$program_target/ctl.py" status >/dev/null; then
+    printf '%s\n' 'Sleep Disabler agent is active but its D-Bus API is unavailable.' >&2
+    exit 1
+fi
+printf '%s\n' 'Agent usable: service active and session D-Bus API responded. Prevention starts OFF.'
+printf '%s\n' "CLI: $bin_target/sleep-disablerctl status"
+if ! command -v gnome-extensions >/dev/null 2>&1; then
+    printf '%s\n' 'Top-bar control pending: gnome-extensions tool is unavailable.' >&2
+    exit 2
+fi
+if ! gnome-extensions info "$extension_id" >/dev/null 2>&1; then
+    printf '%s\n' 'Top-bar control pending: Shell has not discovered the extension.' >&2
+    printf '%s\n' 'Log out and back in, then run: gnome-extensions enable sleep-disabler@local' >&2
+    exit 2
+fi
+# Reload an already enabled extension after copying a new version.
+gnome-extensions disable "$extension_id" >/dev/null 2>&1 || true
+if ! gnome-extensions enable "$extension_id"; then
+    printf '%s\n' 'Top-bar control pending: Shell has not discovered or enabled the extension.' >&2
+    printf '%s\n' 'Log out and back in, then run: gnome-extensions enable sleep-disabler@local' >&2
+    exit 2
+fi
+enabled=false
+if ! enabled_list=$(gnome-extensions list --enabled); then
+    printf '%s\n' 'Top-bar control pending: GNOME could not report enabled extensions.' >&2
+    exit 2
+fi
+while IFS= read -r item; do
+    if [ "$item" = "$extension_id" ]; then enabled=true; break; fi
+done <<EOF
+$enabled_list
+EOF
+if [ "$enabled" != true ]; then
+    printf '%s\n' 'Top-bar control pending: GNOME did not report the extension enabled.' >&2
+    exit 2
+fi
+if ! active_list=$(gnome-extensions list --active); then
+    printf '%s\n' 'Top-bar control pending: GNOME could not report active extensions.' >&2
+    exit 2
+fi
+active=false
+while IFS= read -r item; do
+    if [ "$item" = "$extension_id" ]; then active=true; break; fi
+done <<EOF
+$active_list
+EOF
+if [ "$active" != true ]; then
+    printf '%s\n' 'Top-bar control pending: extension enabled but not active in Shell.' >&2
+    exit 2
+fi
+printf '%s\n' 'Top-bar extension active in Shell. Confirm that its panel item is visible.'
