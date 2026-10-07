@@ -1,0 +1,9 @@
+implement plan:
+
+/goal go into ./linux/gnome-wayland/, read the current code, read git commit history. then go into planning/ and read plan0.6.md, implement it FULLY. double check you've fully implemented it, double check again. you should clear the contents of task.md and create subtasks in very detailed form before you start to keep yourself on track (mark each subtask done after completion and 2 pass double checks), and do not clear the task.md after you are completely finished with the goal.
+after that do another full logical check without code execution for the gnome wayland version, complete stack check from the very top. to ensure no more logical bugs are present. then finish goal. do not try to test it out yet (test the sleep functionality or any scheduling). you are only allowed to probe available api endpoints but do NOT try to sleep my laptop.
+
+
+write plan:
+
+write a plan0.6 in markdown to fully fix all these issues in one go. research if needed. put into ./linux/gnome-wayland/planning/ . double check after u write it that u included all points.
