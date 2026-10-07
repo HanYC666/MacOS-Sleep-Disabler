@@ -1,15 +1,18 @@
 [Unit]
 Description=Sleep Disabler GNOME Wayland prototype
 PartOf=graphical-session.target
-After=graphical-session.target
+# With target default dependencies, wanted services run before the target.
+# Do not add an After dependency that can conflict with that ordering.
+CollectMode=inactive-or-failed
 
 [Service]
-Type=simple
-ExecStart=/usr/bin/python3 %h/.local/lib/sleep-disabler-gnome/agent.py
+Type=dbus
+BusName=org.sleepdisabler.App
+ExecStart=@AGENT_LAUNCHER@
+TimeoutStartSec=20
 Restart=on-failure
 RestartSec=3
 TimeoutStopSec=30
-CollectMode=inactive-or-failed
 
 [Install]
 WantedBy=graphical-session.target

@@ -42,6 +42,8 @@ def main():
     timer.add_argument("--prevention-on", action="store_true")
     sub.add_parser("cancel-timer")
     args = parser.parse_args()
+    if args.command == "failsafe" and args.threshold is not None and not 1 <= args.threshold <= 99:
+        parser.error("threshold must be 1–99")
     app = None
     try:
         bus = dbus.SessionBus()
@@ -56,7 +58,10 @@ def main():
         elif args.command == "dim":
             app.SetLidDimming(args.value == "on")
         elif args.command == "failsafe":
-            threshold = args.threshold if args.threshold is not None else int(state["threshold"])
+            threshold = args.threshold if args.threshold is not None else state.get("threshold")
+            if (not isinstance(threshold, int) or isinstance(threshold, (bool, dbus.Boolean))
+                    or not 1 <= threshold <= 99):
+                parser.error("agent threshold must be an integer in 1–99")
             app.SetFailsafe(args.value == "on", dbus.UInt32(threshold))
         elif args.command == "timer":
             if not 1 <= args.minutes <= 365 * 1440 + 23 * 60 + 59:
