@@ -9,6 +9,7 @@ CollectMode=inactive-or-failed
 Type=dbus
 BusName=org.sleepdisabler.App
 ExecStart=@AGENT_LAUNCHER@
+Environment=@STATE_HOME_ENV@
 TimeoutStartSec=20
 Restart=on-failure
 RestartSec=3

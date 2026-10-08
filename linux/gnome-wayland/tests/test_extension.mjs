@@ -42,7 +42,10 @@ class MenuItem {
     constructor() { Object.assign(this, item()); this.handlers = {}; this.label = {text: ''}; }
     connect(event, callback) { this.handlers[event] = callback; }
 }
-context.Gio.Cancellable = class { cancel() {} };
+context.Gio.Cancellable = class {
+    cancel() { this.cancelled = true; }
+    is_cancelled() { return this.cancelled === true; }
+};
 context.Gio.BusType = {SESSION: 0};
 context.Gio.BusNameWatcherFlags = {NONE: 0};
 context.Gio.bus_watch_name = () => 1;
@@ -119,7 +122,7 @@ assert.equal(panel._prevention.sensitive, false);
 assert.equal(panel._status.label.text, 'Connecting…');
 assert.equal(calls.length, 2, 'connecting requests state and registers the runtime');
 assert.equal(calls[1][3], 'RegisterPanelRuntime');
-assert.equal(calls[1][4].deep_unpack()[0], '5');
+assert.equal(calls[1][4].deep_unpack()[0], '6');
 
 // A current-generation StateChanged may establish connection before GetState.
 const stateSubscription = subscriptions.find(entry => entry.signal === 'StateChanged');

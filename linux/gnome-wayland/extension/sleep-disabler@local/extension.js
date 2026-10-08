@@ -10,9 +10,11 @@ import * as PopupMenu from 'resource:///org/gnome/shell/ui/popupMenu.js';
 const APP = 'org.sleepdisabler.App';
 const PATH = '/org/sleepdisabler/App';
 const IFACE = 'org.sleepdisabler.App1';
-const PANEL_RUNTIME_VERSION = '5';
+const PANEL_RUNTIME_VERSION = '6';
 const STATE_ATTEMPTS = 3;
 const STATE_RETRY_DELAYS = [1, 2];
+const REGISTRATION_ATTEMPTS = 3;
+const REGISTRATION_RETRY_DELAYS = [1, 2];
 
 function value(state, key, fallback = null) {
     const item = state?.[key];
@@ -29,14 +31,21 @@ export default class SleepDisablerExtension extends Extension {
         this._timerSignal = 0;
         this._state = null;
         this._actionError = '';
+        this._connectionError = '';
+        this._registrationError = '';
+        this._actionSerial = 0;
         this._updating = false;
         // A disabled instance may be enabled again while old replies are pending.
         this._generation = (this._generation ?? 0) + 1;
+        this._watchGeneration = (this._watchGeneration ?? 0) + 1;
         this._owner = '';
         this._stateSerial = 0;
+        this._timerSerial = 0;
         this._stateAttempts = 0;
         this._stateRetry = 0;
-        this._runtimeRegistrationStarted = false;
+        this._registrationState = 'idle';
+        this._registrationAttempts = 0;
+        this._registrationRetry = 0;
         this._connectionState = 'disconnected';
         this._cancellable = new Gio.Cancellable();
 
@@ -84,17 +93,24 @@ export default class SleepDisablerExtension extends Extension {
             this._timerItems.push(item);
         }
         this._cancel = new PopupMenu.PopupMenuItem('Cancel countdown');
-        this._cancel.connect('activate', () => this._call('CancelTimer', new GLib.Variant('()')));
+        this._cancel.connect('activate', () => this._call('CancelTimer', new GLib.Variant('()', [])));
         this._button.menu.addMenuItem(this._cancel);
         this._help = new PopupMenu.PopupMenuItem('More options: sleep-disablerctl --help', {reactive: false});
         this._button.menu.addMenuItem(this._help);
 
         Main.panel.addToStatusArea(this.uuid, this._button);
         this._setConnectionState('disconnected');
+        const watchGeneration = this._watchGeneration;
         this._watch = Gio.bus_watch_name(
             Gio.BusType.SESSION, APP, Gio.BusNameWatcherFlags.NONE,
-            (connection, _name, owner) => this._connected(connection, owner),
-            () => this._disconnected()
+            (connection, _name, owner) => {
+                if (watchGeneration === this._watchGeneration)
+                    this._connected(connection, owner);
+            },
+            () => {
+                if (watchGeneration === this._watchGeneration)
+                    this._disconnected();
+            }
         );
     }
 
@@ -102,11 +118,16 @@ export default class SleepDisablerExtension extends Extension {
         if (!this._button)
             return;
         this._generation++;
+        this._cancellable?.cancel();
+        this._cancellable = new Gio.Cancellable();
         this._cancelStateRetry();
+        this._cancelRegistrationRetry();
         this._owner = owner;
         this._stateSerial = 0;
+        this._timerSerial = 0;
         this._stateAttempts = 0;
-        this._runtimeRegistrationStarted = false;
+        this._registrationState = 'idle';
+        this._registrationAttempts = 0;
         if (this._bus && this._signal)
             this._bus.signal_unsubscribe(this._signal);
         if (this._bus && this._timerSignal)
@@ -114,6 +135,9 @@ export default class SleepDisablerExtension extends Extension {
         this._bus = connection;
         this._state = null;
         this._actionError = '';
+        this._connectionError = '';
+        this._registrationError = '';
+        this._actionSerial = 0;
         this._setConnectionState('connecting');
         const generation = this._generation;
         this._signal = connection.signal_subscribe(
@@ -125,6 +149,7 @@ export default class SleepDisablerExtension extends Extension {
                 const [state] = parameters.deep_unpack();
                 this._stateSerial++;
                 this._cancelStateRetry();
+                this._connectionError = '';
                 this._setConnectionState('connected');
                 this._render(state);
             }
@@ -136,7 +161,7 @@ export default class SleepDisablerExtension extends Extension {
                 if (!this._button || generation !== this._generation || !this._state)
                     return;
                 const [remaining] = parameters.deep_unpack();
-                this._stateSerial++;
+                this._timerSerial++;
                 this._state.timerRemaining = new GLib.Variant('t', remaining);
                 this._render(this._state);
             }
@@ -151,39 +176,98 @@ export default class SleepDisablerExtension extends Extension {
         this._stateRetry = 0;
     }
 
+    _cancelRegistrationRetry() {
+        if (this._registrationRetry)
+            GLib.source_remove(this._registrationRetry);
+        this._registrationRetry = 0;
+    }
+
     _registerRuntime() {
-        if (!this._bus || !this._button || this._runtimeRegistrationStarted)
+        if (!this._bus || !this._button ||
+            this._registrationState === 'pending' || this._registrationState === 'succeeded' ||
+            this._registrationState === 'exhausted')
             return;
-        this._runtimeRegistrationStarted = true;
+        this._cancelRegistrationRetry();
+        this._registrationState = 'pending';
+        this._registrationAttempts++;
+        const attempt = this._registrationAttempts;
         const generation = this._generation;
+        const owner = this._owner;
+        const connection = this._bus;
+        const cancellable = this._cancellable;
         try {
-            this._bus.call(this._owner, PATH, IFACE, 'RegisterPanelRuntime',
+            connection.call(owner, PATH, IFACE, 'RegisterPanelRuntime',
                 new GLib.Variant('(s)', [PANEL_RUNTIME_VERSION]), null,
-                Gio.DBusCallFlags.NONE, 5000, this._cancellable, (bus, result) => {
+                Gio.DBusCallFlags.NONE, 5000, cancellable, (bus, result) => {
+                    if (!this._button || generation !== this._generation ||
+                        owner !== this._owner || connection !== this._bus ||
+                        cancellable !== this._cancellable || cancellable.is_cancelled() ||
+                        this._registrationState !== 'pending' ||
+                        attempt !== this._registrationAttempts)
+                        return;
                     try {
                         bus.call_finish(result);
+                        this._registrationState = 'succeeded';
+                        this._registrationError = '';
+                        if (this._state)
+                            this._render(this._state);
                     } catch (error) {
-                        if (this._button && generation === this._generation)
-                            this._showError(error);
+                        this._registrationFailed(error, generation, owner, connection, cancellable, attempt);
                     }
                 });
         } catch (error) {
-            this._showError(error);
+            this._registrationFailed(error, generation, owner, connection, cancellable, attempt);
         }
+    }
+
+    _registrationFailed(error, generation, owner, connection, cancellable, attempt) {
+        if (!this._button || generation !== this._generation ||
+            owner !== this._owner || connection !== this._bus ||
+            cancellable !== this._cancellable || cancellable.is_cancelled() ||
+            this._registrationState !== 'pending' ||
+            attempt !== this._registrationAttempts)
+            return;
+        if (this._registrationAttempts < REGISTRATION_ATTEMPTS) {
+            this._registrationState = 'idle';
+            try {
+                const source = GLib.timeout_add_seconds(GLib.PRIORITY_DEFAULT,
+                    REGISTRATION_RETRY_DELAYS[this._registrationAttempts - 1], () => {
+                        if (this._registrationRetry !== source)
+                            return GLib.SOURCE_REMOVE;
+                        this._registrationRetry = 0;
+                        if (this._button && generation === this._generation &&
+                            owner === this._owner && connection === this._bus &&
+                            cancellable === this._cancellable && !cancellable.is_cancelled())
+                            this._registerRuntime();
+                        return GLib.SOURCE_REMOVE;
+                    });
+                if (!source)
+                    throw new Error('Registration retry source unavailable');
+                this._registrationRetry = source;
+                return;
+            } catch (retryError) {
+                this._registrationState = 'exhausted';
+                this._showError(retryError, 'registration');
+                return;
+            }
+        }
+        this._registrationState = 'exhausted';
+        this._showError(error, 'registration');
     }
 
     _refresh() {
         if (!this._bus || !this._button)
             return;
         const generation = this._generation;
-        // Requests as well as signals supersede older in-flight snapshots.
+        // Newer requests and StateChanged signals supersede older snapshots.
         const serial = ++this._stateSerial;
+        const timerSerial = this._timerSerial;
         const initial = !this._state;
         if (initial)
             this._stateAttempts++;
         try {
-            this._bus.call(this._owner, PATH, IFACE, 'GetState', new GLib.Variant('()'),
-                new GLib.VariantType('(a{sv})'), Gio.DBusCallFlags.NONE, 5000,
+            this._bus.call(this._owner, PATH, IFACE, 'GetState', new GLib.Variant('()', []),
+                new GLib.VariantType('(a{sv})'), Gio.DBusCallFlags.NONE, 3000,
                 this._cancellable, (bus, result) => {
                     if (!this._button || generation !== this._generation)
                         return;
@@ -192,7 +276,10 @@ export default class SleepDisablerExtension extends Extension {
                         if (serial !== this._stateSerial)
                             return;
                         this._cancelStateRetry();
+                        this._connectionError = '';
                         this._setConnectionState('connected');
+                        if (timerSerial !== this._timerSerial && this._state)
+                            state.timerRemaining = this._state.timerRemaining;
                         this._render(state);
                     } catch (error) {
                         this._stateFailed(error, generation, serial);
@@ -210,35 +297,50 @@ export default class SleepDisablerExtension extends Extension {
         if (!this._state && this._stateAttempts < STATE_ATTEMPTS) {
             this._setConnectionState('retrying');
             this._cancelStateRetry();
-            this._stateRetry = GLib.timeout_add_seconds(GLib.PRIORITY_DEFAULT,
-                STATE_RETRY_DELAYS[this._stateAttempts - 1], () => {
-                    if (!this._button || generation !== this._generation)
+            try {
+                const source = GLib.timeout_add_seconds(GLib.PRIORITY_DEFAULT,
+                    STATE_RETRY_DELAYS[this._stateAttempts - 1], () => {
+                        if (this._stateRetry !== source || !this._button ||
+                            generation !== this._generation)
+                            return GLib.SOURCE_REMOVE;
+                        this._stateRetry = 0;
+                        this._refresh();
                         return GLib.SOURCE_REMOVE;
-                    this._stateRetry = 0;
-                    this._refresh();
-                    return GLib.SOURCE_REMOVE;
-                });
-            return;
+                    });
+                if (!source)
+                    throw new Error('Initial-state retry source unavailable');
+                this._stateRetry = source;
+                return;
+            } catch (retryError) {
+                error = retryError;
+            }
         }
         if (!this._state)
             this._setConnectionState('disconnected');
-        this._showError(error);
+        this._showError(error, 'connection');
     }
 
     _disconnected() {
         this._generation++;
+        this._cancellable?.cancel();
         this._cancelStateRetry();
+        this._cancelRegistrationRetry();
         if (this._bus && this._signal)
             this._bus.signal_unsubscribe(this._signal);
         if (this._bus && this._timerSignal)
             this._bus.signal_unsubscribe(this._timerSignal);
         this._bus = null;
         this._owner = '';
-        this._runtimeRegistrationStarted = false;
+        this._registrationState = 'idle';
+        this._registrationAttempts = 0;
         this._signal = 0;
         this._timerSignal = 0;
         this._state = null;
+        this._timerSerial = 0;
         this._actionError = '';
+        this._connectionError = '';
+        this._registrationError = '';
+        this._actionSerial = 0;
         this._setConnectionState('disconnected');
     }
 
@@ -277,6 +379,10 @@ export default class SleepDisablerExtension extends Extension {
             parts.push(error);
         if (this._actionError)
             parts.push(this._actionError);
+        if (this._connectionError)
+            parts.push(this._connectionError);
+        if (this._registrationError)
+            parts.push(this._registrationError);
         const lidRequested = Boolean(value(state, 'lidRequested', false));
         const lidAcquired = Boolean(value(state, 'lidLockAcquired', false));
         const lidOutcome = String(value(state, 'lidOutcome', 'unverified'));
@@ -316,37 +422,54 @@ export default class SleepDisablerExtension extends Extension {
         if (!this._bus || !this._button || this._connectionState !== 'connected')
             return;
         const generation = this._generation;
+        const serial = ++this._actionSerial;
         try {
             this._bus.call(this._owner, PATH, IFACE, method, parameters, null,
-                Gio.DBusCallFlags.NONE, 10000, this._cancellable, (bus, result) => {
+                Gio.DBusCallFlags.NONE, 25000, this._cancellable, (bus, result) => {
                     if (!this._button || generation !== this._generation)
                         return;
                     try {
                         bus.call_finish(result);
+                        if (serial !== this._actionSerial)
+                            return;
                         this._actionError = '';
+                        if (this._state)
+                            this._render(this._state);
                         this._refresh();
                     } catch (error) {
+                        if (serial !== this._actionSerial)
+                            return;
                         this._showError(error);
                         // A rejected toggle should return to the authoritative state.
                         this._refresh();
                     }
                 });
         } catch (error) {
+            if (serial !== this._actionSerial)
+                return;
             this._showError(error);
             this._refresh();
         }
     }
 
-    _showError(error) {
-        this._actionError = `Sleep Disabler error: ${error.message}`;
+    _showError(error, domain = 'action') {
+        const message = `Sleep Disabler error: ${error.message}`;
+        if (domain === 'connection')
+            this._connectionError = message;
+        else if (domain === 'registration')
+            this._registrationError = message;
+        else
+            this._actionError = message;
         if (this._state)
             this._render(this._state);
         else if (this._status)
-            this._status.label.text = this._actionError;
+            this._status.label.text = [this._connectionError, this._registrationError,
+                this._actionError].filter(Boolean).join(' · ');
     }
 
     disable() {
-        if (this._bus && this._owner && this._runtimeRegistrationStarted) {
+        this._watchGeneration = (this._watchGeneration ?? 0) + 1;
+        if (this._bus && this._owner && this._registrationAttempts > 0) {
             try {
                 this._bus.call(this._owner, PATH, IFACE, 'UnregisterPanelRuntime',
                     new GLib.Variant('(s)', [PANEL_RUNTIME_VERSION]), null,
@@ -363,6 +486,7 @@ export default class SleepDisablerExtension extends Extension {
         }
         this._generation++;
         this._cancelStateRetry();
+        this._cancelRegistrationRetry();
         this._cancellable?.cancel();
         if (this._watch)
             Gio.bus_unwatch_name(this._watch);
@@ -374,9 +498,14 @@ export default class SleepDisablerExtension extends Extension {
         this._button = null;
         this._bus = null;
         this._owner = '';
-        this._runtimeRegistrationStarted = false;
+        this._registrationState = 'idle';
+        this._registrationAttempts = 0;
         this._state = null;
+        this._timerSerial = 0;
         this._actionError = '';
+        this._connectionError = '';
+        this._registrationError = '';
+        this._actionSerial = 0;
         this._cancellable = null;
         this._watch = 0;
         this._signal = 0;

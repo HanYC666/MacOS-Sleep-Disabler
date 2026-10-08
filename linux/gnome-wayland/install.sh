@@ -1,6 +1,11 @@
 #!/bin/sh
 set -eu
 
+case "${HOME-}" in
+    /*) ;;
+    *) printf '%s\n' 'HOME must be an absolute path.' >&2; exit 1 ;;
+esac
+
 base_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 extension_id='sleep-disabler@local'
 extension_target="${XDG_DATA_HOME:-$HOME/.local/share}/gnome-shell/extensions/$extension_id"
@@ -47,6 +52,9 @@ if [ -z "${SLEEP_DISABLER_INSTALL_LOCK_FD:-}" ]; then
     printf '%s\n' 'Installer lock descriptor is missing.' >&2
     exit 1
 fi
+if ! "$python_bin" "$base_dir/core_install.py" --python "$python_bin" --preflight-discovery; then
+    exit 1
+fi
 core_committed=false
 core_commit_receipt="$HOME/.local/lib/.sleep-disabler-core-commit.$$"
 if [ -e "$core_commit_receipt" ] || [ -L "$core_commit_receipt" ]; then
@@ -69,6 +77,10 @@ handle_interrupt() {
 }
 trap handle_interrupt INT TERM
 panel_record="$(dirname -- "$extension_target")/.sleep-disabler-panel-transaction.json"
+if [ -L "$extension_target" ] || { [ -e "$extension_target" ] && [ ! -d "$extension_target" ]; }; then
+    printf '%s\n' "Unsupported managed extension destination at $extension_target; inspect it before deployment." >&2
+    exit 1
+fi
 if [ -e "$panel_record" ] || [ -L "$panel_record" ]; then
     printf '%s\n' "Unfinished panel transaction retained at $panel_record; inspect its paths before retrying. No core or panel files were switched." >&2
     exit 1
@@ -146,6 +158,19 @@ gnome_extensions() {
     "$python_bin" "$base_dir/core_install.py" --python "$python_bin" --gnome "$@"
 }
 
+extension_path_matches() {
+    info=$(gnome_extensions info "$extension_id") || return 1
+    printf '%s\n' "$info" | "$python_bin" -c '
+from pathlib import Path
+import sys
+paths = [line.partition(":")[2].strip() for line in sys.stdin.read().splitlines()
+         if line.lstrip().startswith("Path:")]
+expected = Path(sys.argv[1])
+if len(paths) != 1 or not Path(paths[0]).is_absolute() or Path(paths[0]) not in (expected, expected.resolve()):
+    raise SystemExit(1)
+' "$extension_target"
+}
+
 list_has_extension() {
     while IFS= read -r item; do
         [ "$item" = "$extension_id" ] && return 0
@@ -180,6 +205,13 @@ if ! active_list=$(gnome_extensions list --active 2>/dev/null); then
 fi
 if printf '%s\n' "$active_list" | list_has_extension; then
     previous_active=true
+fi
+
+# Core staging/restart may have outlived the Shell owner used by the first
+# preflight. Recheck the current owner, data home, and UUID discovery before
+# persisting panel intent or moving the active extension directory.
+if ! "$python_bin" "$base_dir/core_install.py" --python "$python_bin" --preflight-discovery; then
+    panel_fail_before_switch 'Top-bar control pending: Shell discovery changed before the panel switch.'
 fi
 
 backup="$extension_parent/.sleep-disabler-rollback.${stage##*.}.$$"
@@ -251,7 +283,8 @@ rollback_panel() {
         rollback_ok=false
     fi
     if [ "$previous_active" = true ]; then
-        if [ -n "$previous_panel_runtime" ] && panel_runtime_matches "$previous_panel_runtime"; then
+        if extension_path_matches && [ -n "$previous_panel_runtime" ] &&
+                panel_runtime_matches "$previous_panel_runtime"; then
             printf '%s\n' 'Previous panel runtime proven restored.' >&2
         else
             printf '%s\n' 'Previous panel runtime restoration is unproven; log out and in.' >&2
@@ -318,8 +351,8 @@ if ! mv "$stage" "$extension_target"; then
     exit 2
 fi
 
-if ! gnome_extensions info "$extension_id" >/dev/null 2>&1; then
-    rollback_panel 'Top-bar control pending: Shell did not discover the staged extension.'
+if ! extension_path_matches; then
+    rollback_panel 'Top-bar control pending: Shell did not discover the staged extension at the managed path.'
 fi
 if [ "$previous_enabled" = true ]; then
     if ! gnome_extensions disable "$extension_id" >/dev/null 2>&1; then

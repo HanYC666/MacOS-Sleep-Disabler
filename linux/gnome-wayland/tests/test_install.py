@@ -27,7 +27,16 @@ class InstallerTests(unittest.TestCase):
         self.stubs.mkdir()
         shutil.copytree(SOURCE, self.source)
         helper = self.source / 'core_install.py'
-        helper.write_text(helper.read_text().replace('READINESS_DELAY = 1', 'READINESS_DELAY = 0'))
+        helper.write_text(helper.read_text().replace('READINESS_DELAY = 1', 'READINESS_DELAY = 0')
+                          .replace('def main():', '''def preflight_discovery():
+    marker = Path(os.environ['HOME']) / '.discovery-preflight-count'
+    count = int(marker.read_text()) + 1 if marker.exists() else 1
+    marker.write_text(str(count))
+    if os.environ.get('FAIL_SECOND_PREFLIGHT') == '1' and count == 2:
+        raise ValueError('Shell owner changed before panel switch')
+
+
+def main():'''))
         self.real_python = sys.executable
         self._write_stub('sleep', '#!/bin/sh\nexit 0\n')
         self._write_stub('systemd-analyze', '#!/bin/sh\nexit "${FAIL_UNIT_VERIFY:-0}"\n')
@@ -53,6 +62,14 @@ if command == 'is-active':
 if command == 'is-enabled':
     if '--quiet' not in args: print('enabled' if state['enabled'] else 'disabled')
     sys.exit(0 if state['enabled'] else 1)
+if command == 'show':
+    if '--property=MainPID' in args:
+        print('12345' if state['active'] else '0')
+    elif '--property=DropInPaths' in args:
+        print('')
+    else:
+        print(Path(os.environ['XDG_CONFIG_HOME']) / 'systemd/user/sleep-disabler-gnome.service')
+    sys.exit(0)
 if command == 'enable': state['enabled'] = True
 if command == 'disable': state['enabled'] = False
 if command in ('restart', 'start'): state['active'] = True
@@ -73,27 +90,29 @@ for node in ast.parse(program.read_text()).body:
             if isinstance(target, ast.Name) and target.id in ('AGENT_RUNTIME_VERSION', 'API_VERSION'):
                 constants[target.id] = ast.literal_eval(node.value)
 version = constants['AGENT_RUNTIME_VERSION']
-if version == '0.5.0':
+if version == '0.6.0':
     counter = home / '.core-api-count'
     count = int(counter.read_text()) + 1 if counter.exists() else 1
     counter.write_text(str(count))
     if os.environ.get('CORE_API_FAIL') == '1' or count <= int(os.environ.get('CORE_API_DELAY', '0')): sys.exit(1)
     if os.environ.get('STALE_AGENT') == '1': version = '0.4.0'
 api = constants['API_VERSION']
-if version == '0.5.0' and os.environ.get('BAD_API') == '1': api = 999
+if version == '0.6.0' and os.environ.get('BAD_API') == '1': api = 999
 panel = '1' if os.environ.get('PREV_ACTIVE') == '1' else ''
 target = Path(os.environ['XDG_DATA_HOME']) / 'gnome-shell/extensions/sleep-disabler@local'
 if (home / '.gnome-test-enabled').exists():
-    panel = '5' if (target / 'extension.js').exists() else '1'
-    if panel == '5' and 'PANEL_RUNTIME' in os.environ: panel = os.environ['PANEL_RUNTIME']
-    if panel == '5':
+    panel = '6' if (target / 'extension.js').exists() else '1'
+    if panel == '6' and 'PANEL_RUNTIME' in os.environ: panel = os.environ['PANEL_RUNTIME']
+    if panel == '6':
         counter = home / '.panel-api-count'
         count = int(counter.read_text()) + 1 if counter.exists() else 1
         counter.write_text(str(count))
         if count <= int(os.environ.get('PANEL_API_DELAY', '0')): panel = ''
 print(json.dumps({{'agentRuntimeVersion': version, 'apiVersion': api,
+                  'ownerPID': 12345,
                   'panelRuntimeVersion': panel,
-                  'panelRuntimeRegistered': bool(panel) and os.environ.get('PANEL_UNREGISTERED') != '1'}}))
+                  'panelRuntimeRegistered': bool(panel) and os.environ.get('PANEL_UNREGISTERED') != '1',
+                  'stateHome': os.environ['XDG_STATE_HOME']}}))
 ''')
         self._write_stub('test-python', f'''#!/bin/sh
 if [ "$1" = "-c" ]; then
@@ -109,7 +128,8 @@ state="$HOME/.gnome-test-enabled"
 count="$HOME/.gnome-test-enable-count"
 case "$1" in
   info)
-    [ "$FAIL_DISCOVERY" != 1 ]
+    [ "$FAIL_DISCOVERY" != 1 ] || exit 1
+    printf 'Path: %s\n' "${SHADOW_EXTENSION_PATH:-$XDG_DATA_HOME/gnome-shell/extensions/sleep-disabler@local}"
     ;;
   enable)
     n=0
@@ -216,6 +236,24 @@ exec /bin/mv "$@"
         self.assertTrue((self.home / '.local/lib/sleep-disabler-gnome/agent.py').is_file())
         self.assertTrue((self.home / '.local/bin/sleep-disablerctl').is_file())
 
+    def test_unsafe_home_is_rejected_before_deployment(self):
+        for value in ('', 'relative-home', str(self.home) + '\nunsafe'):
+            with self.subTest(value=repr(value)):
+                result = self.run_installer(HOME=value)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn('HOME', result.stderr)
+                self.assertFalse((self.home / '.local/lib/sleep-disabler-gnome').exists())
+                self.assertFalse(self.target.exists())
+
+    def test_symlinked_core_parent_is_rejected_before_lock_creation(self):
+        (self.home / '.local').mkdir()
+        (self.home / '.local/lib').symlink_to(self.root / 'foreign-lib')
+        result = self.run_installer()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('unsupported managed core parent', result.stderr)
+        self.assertFalse((self.root / 'foreign-lib').exists())
+        self.assertFalse(self.target.exists())
+
     def test_staged_upgrade_success_preserves_old_copy_until_verification(self):
         self.previous_install()
         result = self.run_installer(PREV_ENABLED=1, PREV_ACTIVE=1)
@@ -225,6 +263,17 @@ exec /bin/mv "$@"
         retained = list(self.target.parent.glob('.sleep-disabler-previous.*'))
         self.assertEqual(len(retained), 1)
         self.assertTrue((retained[0] / 'old-marker').is_file())
+
+    def test_shell_discovery_change_after_core_staging_preserves_prior_panel(self):
+        self.previous_install()
+        result = self.run_installer(PREV_ENABLED=1, PREV_ACTIVE=1,
+                                    FAIL_SECOND_PREFLIGHT=1)
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertEqual((self.home / '.discovery-preflight-count').read_text(), '2')
+        self.assertTrue((self.target / 'old-marker').is_file())
+        self.assertFalse((self.target / 'extension.js').exists())
+        self.assertIn('Shell discovery changed before the panel switch', result.stderr)
+        self.assert_agent_preserved()
 
     def test_validation_failure_does_not_touch_active_extension(self):
         self.previous_install()
@@ -247,6 +296,40 @@ exec /bin/mv "$@"
         self.assertIn('Previous extension state restored', result.stderr)
         self.assertTrue((self.home / '.gnome-test-enabled').is_file())
         self.assert_agent_preserved()
+
+    def test_shadowed_staged_uuid_does_not_satisfy_panel_readiness(self):
+        self.previous_install()
+        result = self.run_installer(PREV_ENABLED=1, PREV_ACTIVE=1,
+                                    SHADOW_EXTENSION_PATH=self.home / 'other-extension')
+        self.assertEqual(result.returncode, 2)
+        self.assertIn('managed path', result.stderr)
+        self.assertTrue((self.target / 'old-marker').is_file())
+        self.assert_agent_preserved()
+
+    def test_symlink_alias_does_not_satisfy_panel_path_readiness(self):
+        self.previous_install()
+        alias = self.home / 'extension-alias'
+        alias.symlink_to(self.target)
+        result = self.run_installer(PREV_ENABLED=1, PREV_ACTIVE=1,
+                                    SHADOW_EXTENSION_PATH=alias)
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn('managed path', result.stderr)
+        self.assertTrue((self.target / 'old-marker').is_file())
+        self.assert_agent_preserved()
+
+    def test_unsupported_extension_destination_rejected_before_core_commit(self):
+        for kind in ('file', 'symlink'):
+            with self.subTest(kind=kind):
+                self.target.parent.mkdir(parents=True, exist_ok=True)
+                if kind == 'file':
+                    self.target.write_text('unmanaged')
+                else:
+                    self.target.symlink_to(self.home / 'missing-extension')
+                result = self.run_installer()
+                self.assertEqual(result.returncode, 1, result.stderr)
+                self.assertIn('Unsupported managed extension destination', result.stderr)
+                self.assertFalse((self.home / '.local/lib/sleep-disabler-gnome').exists())
+                self.target.unlink()
 
     def test_enable_failure_rolls_back_previous_extension(self):
         self.previous_install()
@@ -348,7 +431,9 @@ exec /bin/mv "$@"
         result = self.run_installer()
         self.assertEqual(result.returncode, 1)
         self.assertTrue((self.home / '.local/lib/sleep-disabler-gnome/old-marker').exists())
-        self.assertFalse((self.home / '.service-commands').exists())
+        commands = (self.home / '.service-commands').read_text().splitlines()
+        self.assertTrue(all(command.startswith(('is-enabled', 'is-active', 'show'))
+                            for command in commands))
 
     def test_core_health_failures_restore_files_service_and_api(self):
         for failure in ('CORE_API_FAIL', 'STALE_AGENT', 'BAD_API'):
@@ -401,7 +486,7 @@ exec /bin/mv "$@"
         self.assertIn('not proven loaded', result.stderr)
 
     def test_invalid_panel_reports_retain_first_install(self):
-        for report in ('', 'bogus', '4', '6'):
+        for report in ('', 'bogus', '4', '5'):
             with self.subTest(report=report):
                 # Each attempt becomes an upgrade after the retained first install.
                 result = self.run_installer(PANEL_RUNTIME=report)

@@ -48,7 +48,14 @@ class CliTests(unittest.TestCase):
     def test_valid_threshold_endpoints_dispatch(self):
         for value in (1, 99):
             self.assertEqual(self.invoke('failsafe', 'on', str(value))[0], 0)
-            self.app.SetFailsafe.assert_called_with(True, value)
+            self.app.SetFailsafe.assert_called_with(True, value, timeout=25)
+
+    def test_status_and_action_calls_have_explicit_bounds(self):
+        self.assertEqual(self.invoke('on')[0], 0)
+        self.bus.get_object.assert_called_with('org.sleepdisabler.App',
+                                               '/org/sleepdisabler/App', introspect=False)
+        self.app.SetPrevention.assert_called_once_with(True, timeout=25)
+        self.app.GetState.assert_called_with(timeout=3)
 
     def test_malformed_state_threshold_never_dispatches(self):
         for value in (None, '20', True, Boolean(1), 1.5, 0, 100):

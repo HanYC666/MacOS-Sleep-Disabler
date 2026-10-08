@@ -20,6 +20,8 @@ class FakeDBusException(Exception):
 
 
 class FakeGLib:
+    SOURCE_REMOVE = False
+
     def __init__(self):
         self.next_id = 1
         self.sources = {}
@@ -31,6 +33,9 @@ class FakeGLib:
         self.next_id += 1
         self.sources[source] = (seconds, callback)
         return source
+
+    def timeout_add(self, milliseconds, callback):
+        return self.timeout_add_seconds(milliseconds / 1000, callback)
 
     def source_remove(self, source):
         self.removed.append(source)
@@ -84,6 +89,9 @@ class FakeBrightness:
     def read(self):
         return self.value
 
+    def read_async(self, callback, timeout=3):
+        callback(self.read(), None)
+
     def output_identity(self):
         return self.identity + ':card0-eDP-1:intel_backlight'
 
@@ -91,8 +99,54 @@ class FakeBrightness:
         self.writes.append(value)
         self.value = value
 
+    def write_async(self, value, callback, timeout=3):
+        self.write(value)
+        callback(None)
+
 
 class AgentTests(unittest.TestCase):
+    def test_upower_property_evidence_rejects_malformed_values(self):
+        for value in (True, False, '2', b'2', 2.0, -1, 0x100000000, None):
+            with self.subTest(kind=value):
+                with self.assertRaises(ValueError):
+                    agent_module.dbus_uint32(value)
+        for value in (True, False, '5', b'5', None, -1, 101, float('nan'), float('inf')):
+            with self.subTest(percentage=value):
+                self.assertIsNone(agent_module.valid_percent(value))
+        self.assertEqual(agent_module.dbus_uint32(dbus.UInt32(2)), 2)
+        self.assertEqual(agent_module.valid_percent(dbus.Double(5.5)), 5.5)
+        for value in ('', {}, None, 0):
+            with self.subTest(enumeration=value):
+                with self.assertRaises(ValueError):
+                    agent_module.upower_device_list(value)
+        wrong_signature = type('WrongSignature', (list,), {'signature': 's'})()
+        with self.assertRaises(ValueError):
+            agent_module.upower_device_list(wrong_signature)
+        self.assertEqual(agent_module.upower_device_list([]), [])
+
+    def test_clock_interval_rejects_inter_read_pause_without_suspend_proof(self):
+        with mock.patch.object(agent_module.time, 'monotonic', side_effect=[10, 10.7]), \
+                mock.patch.object(agent_module, 'boottime', return_value=10.7):
+            self.assertIsNone(agent_module.sample_clock_gap())
+        baseline = agent_module.ClockGapSample(10, 10, 0, 0)
+        current = agent_module.ClockGapSample(10.7, 10.7, 0, 0.7)
+        self.assertFalse(agent_module.gap_proves_suspend(current, baseline))
+        actual_suspend = agent_module.ClockGapSample(10.7, 10, 0.7, 0.7)
+        self.assertTrue(agent_module.gap_proves_suspend(actual_suspend, baseline))
+        self.assertFalse(agent_module.gap_proves_suspend(actual_suspend, None))
+
+    def test_clock_interval_boundary_and_invalid_samples(self):
+        baseline = agent_module.ClockGapSample(0, 0, 0, 0)
+        at_boundary = agent_module.ClockGapSample(0.5, 0, 0.5, 0.5)
+        below_boundary = agent_module.ClockGapSample(0.499, 0, 0.499, 0.499)
+        self.assertTrue(agent_module.gap_proves_suspend(at_boundary, baseline))
+        self.assertFalse(agent_module.gap_proves_suspend(below_boundary, baseline))
+        for readings in ((10, 10.051), (float('nan'), 10), (10, 9.9)):
+            with self.subTest(readings=readings):
+                with mock.patch.object(agent_module.time, 'monotonic', side_effect=readings), \
+                        mock.patch.object(agent_module, 'boottime', return_value=10):
+                    self.assertIsNone(agent_module.sample_clock_gap())
+
     def test_dim_requires_target_readback_and_preserves_prepared_recovery(self):
         for actual in (70, 5):
             with self.subTest(actual=actual):
@@ -104,14 +158,15 @@ class AgentTests(unittest.TestCase):
                 a.enabled = a.lid_dimming = a.lid_closed = True
                 a.brightness_adapter.write = lambda _value: setattr(a.brightness_adapter, 'value', actual)
                 self.assertEqual(a.dim_brightness(), 'pending')
-                self.assertEqual(a.brightness_record['phase'], 'prepared')
+                self.assertEqual(a.brightness_record['phase'], 'set-confirmed')
                 self.assertEqual(json.loads(a.brightness_path.read_text()), a.brightness_record)
                 self.assertFalse(a.state()['brightnessDimmed'])
                 self.assertTrue(a.state()['brightnessRecoveryPending'])
                 self.assertIn('Dim readback differs', a.brightness_error)
                 result = a.restore_brightness()
-                self.assertEqual(result, 'manual-change-preserved' if actual == 70 else 'pending')
+                self.assertEqual(result, 'pending')
                 self.assertEqual(a.brightness_adapter.value, actual)
+                self.assertEqual(json.loads(a.brightness_path.read_text()), a.brightness_record)
 
     def test_recovery_bus_operations_have_explicit_short_timeouts(self):
         a = self.agent
@@ -127,8 +182,311 @@ class AgentTests(unittest.TestCase):
             self.assertTrue(a.attempt_session_release())
         remote.Get.assert_called_once_with(agent_module.BRIGHTNESS_IFACE, 'Brightness', timeout=3)
         remote.Set.assert_called_once_with(agent_module.BRIGHTNESS_IFACE, 'Brightness', 0, timeout=3)
-        remote.GetNameOwner.assert_called_once_with(agent_module.SESSION, timeout=3)
+        self.assertEqual(remote.GetNameOwner.call_args_list, [
+            mock.call(agent_module.SESSION, timeout=3),
+            mock.call(':1.gnome', timeout=3)])
         remote.Uninhibit.assert_called_once_with(7, timeout=3)
+
+    def test_brightness_async_read_validates_reply_and_uses_short_timeout(self):
+        remote = mock.Mock()
+        callbacks = []
+        adapter = agent_module.LegacyBrightness(self.agent)
+        with mock.patch.object(self.agent, 'proxy', return_value=remote):
+            adapter.read_async(lambda value, failure: callbacks.append((value, failure)))
+        request = remote.Get.call_args
+        self.assertEqual(request.args, (agent_module.BRIGHTNESS_IFACE, 'Brightness'))
+        self.assertEqual(request.kwargs['timeout'], 3)
+        request.kwargs['reply_handler'](101)
+        self.assertIsNone(callbacks[0][0])
+        self.assertIsInstance(callbacks[0][1], ValueError)
+        for malformed in (True, 50.5, '50', agent_module.dbus.Boolean(True)):
+            with self.subTest(value=repr(malformed)):
+                request.kwargs['reply_handler'](malformed)
+                self.assertIsNone(callbacks[-1][0])
+                self.assertIsInstance(callbacks[-1][1], ValueError)
+        request.kwargs['reply_handler'](agent_module.dbus.Int32(50))
+        self.assertEqual(callbacks[-1], (50, None))
+
+    def test_brightness_sync_read_rejects_coercible_malformed_types(self):
+        remote = mock.Mock()
+        adapter = agent_module.LegacyBrightness(self.agent)
+        with mock.patch.object(self.agent, 'proxy', return_value=remote):
+            for malformed in (True, 50.5, '50', agent_module.dbus.Boolean(True)):
+                with self.subTest(value=repr(malformed)):
+                    remote.Get.return_value = malformed
+                    with self.assertRaisesRegex(ValueError, 'No usable'):
+                        adapter.read()
+            remote.Get.return_value = agent_module.dbus.Int32(50)
+            self.assertEqual(adapter.read(), 50)
+
+    def test_brightness_probe_pins_owner_and_reconciles_after_async_read(self):
+        a = self.agent
+        a.reconcile_brightness_async = mock.Mock()
+        a.brightness_adapter = None
+        a.brightness_available = False
+        names, introspection, props = mock.Mock(), mock.Mock(), mock.Mock()
+        a.proxy = mock.Mock(side_effect=lambda _bus, owner, _path, interface:
+            names if owner == 'org.freedesktop.DBus' else
+            introspection if interface == 'org.freedesktop.DBus.Introspectable' else props)
+        with mock.patch.object(agent_module.LegacyBrightness, 'output_identity',
+                               return_value='gnome-settings-daemon:built-in-panel:eDP-1:backlight'):
+            agent_module.Agent.refresh_brightness_capability(a, 'owner-return')
+            self.assertFalse(a.brightness_available)
+            first = names.GetNameOwner.call_args.kwargs
+            self.assertEqual(first['timeout'], 3)
+            first['reply_handler'](':1.power')
+            self.assertEqual(introspection.Introspect.call_args.kwargs['timeout'], 3)
+            introspection.Introspect.call_args.kwargs['reply_handler'](
+                '<node><interface name="org.gnome.SettingsDaemon.Power.Screen">'
+                '<property name="Brightness" type="i" access="readwrite"/>'
+                '</interface></node>')
+            self.assertEqual(props.Get.call_args.kwargs['timeout'], 3)
+            props.Get.call_args.kwargs['reply_handler'](70)
+            self.assertFalse(a.brightness_available)
+            names.GetNameOwner.call_args.kwargs['reply_handler'](':1.power')
+        self.assertTrue(a.brightness_available)
+        self.assertEqual(a.brightness_adapter.owner, ':1.power')
+        a.reconcile_brightness_async.assert_called_once_with('owner-return')
+
+    def test_brightness_probe_deadline_setup_failure_leaves_no_operation(self):
+        a = self.agent
+        a.reconcile_brightness_async = mock.Mock()
+        with mock.patch.object(fake_glib, 'timeout_add', side_effect=OSError('source setup')):
+            agent_module.Agent.refresh_brightness_capability(a, 'owner-return')
+        self.assertIsNone(a.brightness_probe_operation)
+        self.assertFalse(a.brightness_available)
+        a.reconcile_brightness_async.assert_called_once_with('owner-return')
+
+    def test_power_refresh_deadline_setup_failure_completes_waiter(self):
+        a = self.agent
+        completed = []
+        with mock.patch.object(fake_glib, 'timeout_add', side_effect=OSError('source setup')), \
+                mock.patch.object(agent_module.LOG, 'warning'):
+            agent_module.Agent.refresh_power_async(a, callback=completed.append,
+                                                    reconcile_lid=False)
+        self.assertIsNone(a.power_refresh)
+        self.assertEqual(completed, [False])
+        self.assertEqual(a.battery_discharge_state, 'unknown')
+
+    def test_power_refresh_rejects_expired_parent_deadline_without_new_work(self):
+        a = self.agent
+        completed = []
+        with mock.patch.object(agent_module.time, 'monotonic', return_value=100.0), \
+                mock.patch.object(fake_glib, 'timeout_add') as timeout_add:
+            agent_module.Agent.refresh_power_async(a, callback=completed.append,
+                                                    deadline=99.0)
+        self.assertEqual(completed, [False])
+        self.assertIsNone(a.power_refresh)
+        timeout_add.assert_not_called()
+
+    def test_power_refresh_caps_source_to_parent_deadline(self):
+        a = self.agent
+        completed = []
+        with mock.patch.object(agent_module.time, 'monotonic', return_value=100.0), \
+                mock.patch.object(fake_glib, 'timeout_add', side_effect=OSError('source setup')) as timeout_add, \
+                mock.patch.object(agent_module.LOG, 'warning'):
+            agent_module.Agent.refresh_power_async(a, callback=completed.append,
+                                                    deadline=100.75)
+        self.assertEqual(timeout_add.call_args.args[0], 750)
+        self.assertEqual(completed, [False])
+        self.assertIsNone(a.power_refresh)
+
+    def test_coalesced_power_waiter_observes_earlier_parent_deadline(self):
+        a = self.agent
+        completed = []
+        a.power_refresh = {'deadline': 106.0, 'waiters': [],
+                           'reconcile_lid': False, 'check_failsafe': False}
+        with mock.patch.object(agent_module.time, 'monotonic', return_value=100.0):
+            agent_module.Agent.refresh_power_async(
+                a, callback=completed.append, deadline=100.75)
+        self.assertEqual(len(a.power_refresh['waiters']), 1)
+        self.assertEqual(len(fake_glib.sources), 1)
+        source = next(iter(fake_glib.sources))
+        self.assertEqual(fake_glib.sources[source][0], 0.75)
+        fake_glib.sources[source][1]()
+        self.assertEqual(completed, [False])
+        a.power_refresh['waiters'][0](True)
+        self.assertEqual(completed, [False])
+
+    def test_coalesced_power_waiter_success_removes_earlier_deadline(self):
+        a = self.agent
+        completed = []
+        a.power_refresh = {'deadline': 106.0, 'waiters': [],
+                           'reconcile_lid': False, 'check_failsafe': False}
+        with mock.patch.object(agent_module.time, 'monotonic', return_value=100.0):
+            agent_module.Agent.refresh_power_async(
+                a, callback=completed.append, deadline=100.75)
+            source = next(iter(fake_glib.sources))
+            a.power_refresh['waiters'][0](True)
+        self.assertEqual(completed, [True])
+        self.assertNotIn(source, fake_glib.sources)
+
+    def test_power_snapshot_waits_for_all_devices_and_final_owner(self):
+        a = self.agent
+        names, root, first, second, display = (mock.Mock() for _ in range(5))
+        remotes = {agent_module.UPOWER_PATH: root,
+                   '/battery/one': first, '/battery/two': second,
+                   '/battery/display': display}
+        a.proxy = mock.Mock(side_effect=lambda _bus, owner, path, _iface:
+                            names if owner == 'org.freedesktop.DBus' else remotes[path])
+        a.publish = mock.Mock()
+        a.handle_lid_change = mock.Mock()
+        completed = []
+        agent_module.Agent.refresh_power_async(a, callback=completed.append)
+        names.GetNameOwner.call_args.kwargs['reply_handler'](':1.upower')
+        for index, value in enumerate((True, True, False)):
+            root.Get.call_args_list[index].kwargs['reply_handler'](value)
+        root.EnumerateDevices.call_args.kwargs['reply_handler'](
+            ['/battery/one', '/battery/two'])
+        first.GetAll.call_args.kwargs['reply_handler'](
+            {'Type': 2, 'PowerSupply': True, 'IsPresent': True,
+             'State': 2, 'Percentage': 10.0})
+        self.assertEqual(completed, [])
+        second.GetAll.call_args.kwargs['reply_handler'](
+            {'Type': 2, 'PowerSupply': True, 'IsPresent': True,
+             'State': 1, 'Percentage': 20.0})
+        root.GetDisplayDevice.call_args.kwargs['reply_handler']('/battery/display')
+        display.Get.call_args.kwargs['reply_handler'](15.0)
+        self.assertEqual(completed, [])
+        self.assertIsNone(a.battery_percent)
+        names.GetNameOwner.call_args.kwargs['reply_handler'](':1.upower')
+        self.assertEqual(completed, [True])
+        self.assertEqual((a.on_battery, a.lid_closed, a.battery_percent,
+                          a.battery_discharge_state), (True, False, 15.0, 'discharging'))
+
+    def test_power_snapshot_failed_device_is_all_unknown(self):
+        a = self.agent
+        names, root, first, second = (mock.Mock() for _ in range(4))
+        remotes = {agent_module.UPOWER_PATH: root,
+                   '/battery/one': first, '/battery/two': second}
+        a.proxy = mock.Mock(side_effect=lambda _bus, owner, path, _iface:
+                            names if owner == 'org.freedesktop.DBus' else remotes[path])
+        a.publish = mock.Mock()
+        completed = []
+        agent_module.Agent.refresh_power_async(a, callback=completed.append)
+        names.GetNameOwner.call_args.kwargs['reply_handler'](':1.upower')
+        for index, value in enumerate((True, False)):
+            root.Get.call_args_list[index].kwargs['reply_handler'](value)
+        root.EnumerateDevices.call_args.kwargs['reply_handler'](
+            ['/battery/one', '/battery/two'])
+        first.GetAll.call_args.kwargs['reply_handler'](
+            {'Type': 2, 'PowerSupply': True, 'IsPresent': True,
+             'State': 2, 'Percentage': 10.0})
+        second.GetAll.call_args.kwargs['error_handler'](RuntimeError('unreadable'))
+        self.assertEqual(completed, [False])
+        self.assertEqual((a.on_battery, a.lid_closed, a.battery_percent),
+                         (None, None, None))
+
+    def test_power_snapshot_rejects_replaced_owner_after_complete_read(self):
+        a = self.agent
+        names, root = mock.Mock(), mock.Mock()
+        a.proxy = mock.Mock(side_effect=lambda _bus, owner, _path, _iface:
+                            names if owner == 'org.freedesktop.DBus' else root)
+        a.publish = mock.Mock()
+        completed = []
+        agent_module.Agent.refresh_power_async(a, callback=completed.append)
+        names.GetNameOwner.call_args.kwargs['reply_handler'](':1.old')
+        for index, value in enumerate((False, False)):
+            root.Get.call_args_list[index].kwargs['reply_handler'](value)
+        root.EnumerateDevices.call_args.kwargs['reply_handler']([])
+        self.assertEqual(completed, [])
+        names.GetNameOwner.call_args.kwargs['reply_handler'](':1.new')
+        self.assertEqual(completed, [False])
+        self.assertIsNone(a.on_battery)
+        names.GetNameOwner.call_args.kwargs['reply_handler'](':1.old')
+        self.assertEqual(completed, [False])
+
+    def test_brightness_probe_rejects_owner_replacement_after_read(self):
+        a = self.agent
+        names, introspection, props = mock.Mock(), mock.Mock(), mock.Mock()
+        a.proxy = mock.Mock(side_effect=lambda _bus, owner, _path, interface:
+            names if owner == 'org.freedesktop.DBus' else
+            introspection if interface == 'org.freedesktop.DBus.Introspectable' else props)
+        a.reconcile_brightness_async = mock.Mock()
+        with mock.patch.object(agent_module.LegacyBrightness, 'output_identity', return_value='output'):
+            agent_module.Agent.refresh_brightness_capability(a, 'owner-return')
+            names.GetNameOwner.call_args.kwargs['reply_handler'](':1.old')
+            introspection.Introspect.call_args.kwargs['reply_handler'](
+                '<node><interface name="org.gnome.SettingsDaemon.Power.Screen">'
+                '<property name="Brightness" type="i" access="readwrite"/>'
+                '</interface></node>')
+            props.Get.call_args.kwargs['reply_handler'](70)
+            names.GetNameOwner.call_args.kwargs['reply_handler'](':1.new')
+        self.assertIsNone(a.brightness_adapter)
+        self.assertFalse(a.brightness_available)
+        a.reconcile_brightness_async.assert_called_once_with('owner-return')
+
+    def test_brightness_probe_ignores_late_reply_after_owner_loss(self):
+        a = self.agent
+        a.proxy = mock.Mock(return_value=mock.Mock())
+        a.reconcile_brightness_async = mock.Mock()
+        agent_module.Agent.refresh_brightness_capability(a, 'periodic')
+        callback = a.proxy.return_value.GetNameOwner.call_args.kwargs['reply_handler']
+        a.on_owner_change(agent_module.BRIGHTNESS, ':1.old', '')
+        callback(':1.old')
+        self.assertIsNone(a.brightness_adapter)
+        self.assertFalse(a.brightness_available)
+        a.reconcile_brightness_async.assert_called_once_with('owner-loss')
+
+    def test_brightness_probe_deadline_ignores_late_owner_reply(self):
+        a = self.agent
+        a.proxy = mock.Mock(return_value=mock.Mock())
+        a.reconcile_brightness_async = mock.Mock()
+        agent_module.Agent.refresh_brightness_capability(a, 'periodic')
+        callback = a.proxy.return_value.GetNameOwner.call_args.kwargs['reply_handler']
+        source = a.brightness_probe_operation['source']
+        self.assertFalse(fake_glib.sources[source][1]())
+        callback(':1.old')
+        self.assertIsNone(a.brightness_probe_operation)
+        self.assertFalse(a.brightness_available)
+        a.reconcile_brightness_async.assert_called_once_with('periodic')
+
+    def test_brightness_probe_rejects_late_final_owner_success(self):
+        a = self.agent
+        names, introspection, props = mock.Mock(), mock.Mock(), mock.Mock()
+        a.proxy = mock.Mock(side_effect=lambda _bus, owner, _path, interface:
+            names if owner == 'org.freedesktop.DBus' else
+            introspection if interface == 'org.freedesktop.DBus.Introspectable' else props)
+        a.reconcile_brightness_async = mock.Mock()
+        with mock.patch.object(agent_module.LegacyBrightness, 'output_identity', return_value='output'), \
+                mock.patch.object(agent_module.time, 'monotonic', return_value=100):
+            agent_module.Agent.refresh_brightness_capability(a, 'periodic')
+            names.GetNameOwner.call_args.kwargs['reply_handler'](':1.old')
+            introspection.Introspect.call_args.kwargs['reply_handler'](
+                '<node><interface name="org.gnome.SettingsDaemon.Power.Screen">'
+                '<property name="Brightness" type="i" access="readwrite"/>'
+                '</interface></node>')
+            props.Get.call_args.kwargs['reply_handler'](70)
+            final_owner = names.GetNameOwner.call_args.kwargs['reply_handler']
+        with mock.patch.object(agent_module.time, 'monotonic', return_value=113):
+            final_owner(':1.old')
+        self.assertIsNone(a.brightness_probe_operation)
+        self.assertIsNone(a.brightness_adapter)
+        self.assertFalse(a.brightness_available)
+        a.reconcile_brightness_async.assert_called_once_with('periodic')
+
+    def test_canceled_brightness_probe_does_not_dispatch_read_after_late_introspection(self):
+        a = self.agent
+        names, introspection, props = mock.Mock(), mock.Mock(), mock.Mock()
+        a.proxy = mock.Mock(side_effect=lambda _bus, owner, _path, interface:
+            names if owner == 'org.freedesktop.DBus' else
+            introspection if interface == 'org.freedesktop.DBus.Introspectable' else props)
+        agent_module.Agent.refresh_brightness_capability(a)
+        names.GetNameOwner.call_args.kwargs['reply_handler'](':1.old')
+        late = introspection.Introspect.call_args.kwargs['reply_handler']
+        a.cancel_brightness_probe()
+        late('<node><interface name="org.gnome.SettingsDaemon.Power.Screen">'
+             '<property name="Brightness" type="i" access="readwrite"/>'
+             '</interface></node>')
+        props.Get.assert_not_called()
+
+    def test_shell_brightness_owner_change_does_not_drop_legacy_adapter(self):
+        a = self.agent
+        adapter = a.brightness_adapter
+        a.on_owner_change(agent_module.SHELL_BRIGHTNESS, ':1.old', '')
+        self.assertIs(a.brightness_adapter, adapter)
+        self.assertTrue(a.brightness_available)
+        a.refresh_brightness_capability.assert_not_called()
 
     def test_dim_readback_exception_retains_prepared_record_without_healthy_claim(self):
         a = self.agent
@@ -136,14 +494,46 @@ class AgentTests(unittest.TestCase):
         with mock.patch.object(a.brightness_adapter, 'read',
                                side_effect=[70, FakeDBusException('readback timed out')]):
             self.assertEqual(a.dim_brightness(), 'pending')
-        self.assertEqual(a.brightness_record['phase'], 'prepared')
+        self.assertEqual(a.brightness_record['phase'], 'set-confirmed')
         self.assertEqual(json.loads(a.brightness_path.read_text()), a.brightness_record)
         self.assertFalse(a.state()['brightnessDimmed'])
         self.assertTrue(a.state()['brightnessRecoveryPending'])
         self.assertEqual(a.brightness_adapter.value, 0)
-        # A later readable target can be restored safely from the prepared intent.
+        # A later readable target can be restored after the durable Set acknowledgement.
         self.assertEqual(a.restore_brightness(), 'restored')
         self.assertEqual(a.brightness_adapter.value, 70)
+
+    def test_timed_out_brightness_set_keeps_prepared_journal_through_late_write(self):
+        a = self.agent
+        a.enabled = a.lid_dimming = a.lid_closed = True
+        adapter = a.brightness_adapter
+        adapter.write = mock.Mock(side_effect=FakeDBusException('Set timed out'))
+        self.assertEqual(a.dim_brightness(), 'pending')
+        self.assertEqual(a.brightness_record['phase'], 'prepared')
+        record = json.loads(a.brightness_path.read_text())
+        self.assertEqual(a.restore_brightness(), 'pending')
+        self.assertEqual(adapter.value, 70)
+        adapter.value = 0  # A dispatched remote Set applies after the timeout.
+        self.assertEqual(a.restore_brightness(), 'pending')
+        self.assertEqual(json.loads(a.brightness_path.read_text()), record)
+        self.assertTrue(a.brightness_recovery_pending())
+        # Restart cannot infer whether that timed-out Set has finished.
+        a.brightness_record = None
+        a.brightness_journal_state = 'absent'
+        self.assertEqual(a.recover_brightness(), 'loaded')
+        self.assertEqual(a.restore_brightness(), 'pending')
+        self.assertEqual(json.loads(a.brightness_path.read_text()), record)
+
+    def test_legacy_prepared_brightness_journal_remains_uncertain(self):
+        a = self.agent
+        record = {"schema": 2, "identity": a.brightness_adapter.output_identity(),
+                  "machine": agent_module.machine_identity(), "before": 70,
+                  "target": 0, "phase": "prepared"}
+        a.brightness_path.write_text(json.dumps(record))
+        a.brightness_record = None
+        self.assertEqual(a.recover_brightness(), 'loaded')
+        self.assertEqual(a.restore_brightness(), 'pending')
+        self.assertEqual(json.loads(a.brightness_path.read_text()), record)
 
     def test_method_proxy_disables_hidden_introspection(self):
         bus = mock.Mock()
@@ -179,7 +569,7 @@ class AgentTests(unittest.TestCase):
                 mock.patch.object(agent_module, 'data_home', return_value=Path(self.directory.name)), \
                 mock.patch.object(agent_module.Agent, 'load_settings', side_effect=lambda: events.append(('settings', 'loaded'))), \
                 mock.patch.object(agent_module.Agent, 'refresh_brightness_capability'), \
-                mock.patch.object(agent_module.Agent, 'refresh_power'), \
+                mock.patch.object(agent_module.Agent, 'refresh_power_async'), \
                 mock.patch.object(agent_module.Agent, 'reconcile_brightness'):
             agent_module.Agent()
         self.assertEqual(events[:3], [('session', False), ('system', False), ('name', 'requested')])
@@ -187,6 +577,30 @@ class AgentTests(unittest.TestCase):
             self.assertLess(events.index((name, 'Disconnected')), events.index(('settings', 'loaded')))
         session.get_is_connected.assert_has_calls([mock.call(), mock.call()])
         system.get_is_connected.assert_has_calls([mock.call(), mock.call()])
+
+    def test_startup_bus_construction_failure_closes_existing_connection(self):
+        session = mock.Mock()
+        with mock.patch.object(dbus, 'SessionBus', return_value=session, create=True), \
+                mock.patch.object(dbus, 'SystemBus', side_effect=RuntimeError('system bus failed'), create=True), \
+                mock.patch.object(dbus.mainloop.glib, 'DBusGMainLoop', create=True):
+            with self.assertRaisesRegex(RuntimeError, 'system bus failed'):
+                agent_module.Agent()
+        session.close.assert_called_once_with()
+
+    def test_startup_signal_registration_failure_closes_both_buses(self):
+        session, system = mock.Mock(), mock.Mock()
+        system.add_signal_receiver.side_effect = RuntimeError('signal registration failed')
+        with mock.patch.object(dbus, 'SessionBus', return_value=session, create=True), \
+                mock.patch.object(dbus, 'SystemBus', return_value=system, create=True), \
+                mock.patch.object(dbus.service, 'BusName', create=True), \
+                mock.patch.object(dbus.mainloop.glib, 'DBusGMainLoop', create=True), \
+                mock.patch.object(fake_glib, 'MainLoop', return_value=mock.Mock(), create=True), \
+                mock.patch.object(agent_module, 'data_home', return_value=Path(self.directory.name)):
+            with self.assertRaisesRegex(RuntimeError, 'signal registration failed'):
+                agent_module.Agent()
+        session.close.assert_called_once_with()
+        system.close.assert_called_once_with()
+        self.assertEqual(fake_glib.sources, {})
 
     def test_startup_disconnected_without_signal_cleans_locally_and_refuses_run(self):
         a = self.agent
@@ -221,7 +635,10 @@ class AgentTests(unittest.TestCase):
             a.on_session_bus_disconnected()
             a.on_system_bus_disconnected()
             a.on_session_bus_disconnected()
+            _kwargs['reply_handler']()
         remote.Uninhibit.side_effect = disconnect
+        remote.GetNameOwner.side_effect = lambda _name, **kwargs: kwargs['reply_handler'](':1.gnome')
+        a.session_bus = types.SimpleNamespace(get_is_connected=lambda: True)
         with mock.patch.object(a, 'proxy', return_value=remote), \
                 mock.patch.object(a, 'acquire') as acquire:
             a.on_system_bus_disconnected()
@@ -244,7 +661,10 @@ class AgentTests(unittest.TestCase):
         write = a.brightness_adapter.write
         a.brightness_adapter.write = lambda value: (events.append('brightness'), write(value))[1]
         remote = mock.Mock()
-        remote.Uninhibit.side_effect = lambda _cookie, **_kwargs: events.append('uninhibit')
+        remote.GetNameOwner.side_effect = lambda _name, **kwargs: kwargs['reply_handler'](':1.gnome')
+        remote.Uninhibit.side_effect = lambda _cookie, **kwargs: (
+            events.append('uninhibit'), kwargs['reply_handler']())
+        a.session_bus = types.SimpleNamespace(get_is_connected=lambda: True)
         with mock.patch.object(a, 'proxy', return_value=remote):
             a.on_system_bus_disconnected()
         self.assertEqual(events[:2], ['brightness', 'uninhibit'])
@@ -268,7 +688,7 @@ class AgentTests(unittest.TestCase):
         a = self.agent
         a.publish = types.MethodType(agent_module.Agent.publish, a)
         a.StateChanged = mock.Mock(side_effect=FakeDBusException('disconnected'))
-        a.SetLidMode(False)
+        a.SetLidMode(False, reply=mock.Mock(), error=mock.Mock())
         self.assertFalse(a.lid_mode)
         self.assertFalse(json.loads(a.settings_path.read_text())['lid_mode'])
         a.stop()
@@ -301,6 +721,9 @@ class AgentTests(unittest.TestCase):
         a.brightness_retry_after = 0
         a.brightness_retry_pending = False
         a.brightness_redim_suppressed = False
+        a.brightness_release_pending = False
+        a.dimming_verifications = set()
+        a.dimming_verification = None
         a.brightness_adapter = FakeBrightness()
         a.brightness_available = True
         a.timer_phase = 'idle'
@@ -309,10 +732,14 @@ class AgentTests(unittest.TestCase):
         a.require_lid = False
         a.require_prevention = False
         a.last_timer_state = -1
-        a.clock_gap = 0
+        a.clock_gap = agent_module.ClockGapSample(0, 0, 0, 0)
         a.logind_owner_generation = 0
         a.last_prepare_signal = None
         a.sleep_tx = a.idle_sleep_transaction()
+        a.sleep_reconcile_operation = None
+        a.suspend_preflight_operation = None
+        a.suspend_attempt = None
+        a.failsafe_evaluation = None
         a.sleep_outcome = 'none'
         a.suspend_request_outcome = 'none'
         a.system_bus = object()
@@ -321,14 +748,23 @@ class AgentTests(unittest.TestCase):
         a.session_cookie_state = 'absent'
         a.session_cookie_owner = ''
         a.session_owner_generation = 0
+        a.session_release_operation = None
+        a.prevention_release = None
+        a.prevention_acquisition = None
+        a.shell_owner_generation = 0
         a.inhibitor_outcome = 'absent'
         a.release_attempts = 0
         a.release_retry_after = 0
         a.release_retry_source = 0
         a.exit_failure = False
         a.shutting_down = False
+        a.stop_deadline_source = 0
         a.panel_runtime_version = ''
         a.panel_runtime_sender = ''
+        a.panel_registration_cancellers = set()
+        a.prevention_enable_requests = set()
+        a.prevention_disable_requests = set()
+        a.dimming_disable_requests = set()
         a.lid_error = ''
         a.last_error = ''
         a.enabled = False
@@ -337,7 +773,10 @@ class AgentTests(unittest.TestCase):
         a.lid_dimming = False
         a.lid_closed = False
         a.lid_fd = None
+        a.lid_acquisition = None
+        a.lid_mode_request = None
         a.fd = None
+        a.sleep_fd_owner = ''
         a.lid_outcome = 'unverified'
         a.failsafe = False
         a.failsafe_triggered = False
@@ -346,6 +785,14 @@ class AgentTests(unittest.TestCase):
         a.battery_discharging = False
         a.battery_discharge_state = 'unknown'
         a.battery_percent = None
+        a.power_generation = 0
+        a.power_refresh = None
+        a.power_last_known_lid = None
+        a.timer_start = None
+        a.brightness_probe_generation = 0
+        a.brightness_probe_operation = None
+        a.brightness_dim_operation = None
+        a.brightness_restore_operation = None
         a.recovering = False
         a.last_timer_minutes = 30
         a.last_timer_require_lid = False
@@ -355,6 +802,8 @@ class AgentTests(unittest.TestCase):
         a.publish = mock.Mock()
         a.notify = mock.Mock()
         a.refresh_power = mock.Mock()
+        a.refresh_power_async = mock.Mock(side_effect=lambda callback=None, **_kwargs:
+                                          callback(True) if callback is not None else None)
         a.refresh_brightness_capability = mock.Mock()
         a.TimerChanged = mock.Mock()
         a.check_failsafe = mock.Mock()
@@ -371,7 +820,8 @@ class AgentTests(unittest.TestCase):
             'phase': 'request-pending', 'origin': origin, 'reason': reason,
             'requested_at': requested, 'request_reply': reply,
             'saw_prepare_true': False, 'saw_prepare_false': False,
-            'gap_baseline': baseline, 'uncertain_since': requested,
+            'gap_baseline': agent_module.ClockGapSample(baseline, requested, baseline, baseline),
+            'uncertain_since': requested,
             'owner_generation': self.agent.logind_owner_generation,
         }
         self.agent.suspend_request_outcome = reply
@@ -432,8 +882,10 @@ class AgentTests(unittest.TestCase):
         login = types.SimpleNamespace(Inhibit=mock.Mock(
             return_value=types.SimpleNamespace(take=mock.Mock(return_value=91))))
         gnome = types.SimpleNamespace(Inhibit=mock.Mock(return_value=27))
+        names = types.SimpleNamespace(GetNameOwner=mock.Mock(return_value=':1.login'))
         self.agent.proxy = mock.Mock(side_effect=lambda _bus, name, _path, _interface:
-                                     login if name == agent_module.LOGIN else gnome)
+                                     names if name == 'org.freedesktop.DBus' else
+                                     login if name == ':1.login' else gnome)
 
         self.agent.acquire()
 
@@ -479,6 +931,7 @@ class AgentTests(unittest.TestCase):
         self.agent.brightness_adapter.value = 35
         self.agent.property = mock.Mock(side_effect=[False, True, True])
         self.agent.proxy = mock.Mock(return_value=types.SimpleNamespace(
+            GetNameOwner=mock.Mock(return_value=':1.upower'),
             EnumerateDevices=mock.Mock(return_value=[])))
         self.agent.refresh_power = agent_module.Agent.refresh_power.__get__(self.agent)
 
@@ -495,6 +948,7 @@ class AgentTests(unittest.TestCase):
         self.agent.brightness_adapter.value = 35
         self.agent.property = mock.Mock(side_effect=[False, True, True])
         self.agent.proxy = mock.Mock(return_value=types.SimpleNamespace(
+            GetNameOwner=mock.Mock(return_value=':1.upower'),
             EnumerateDevices=mock.Mock(return_value=[])))
         self.agent.refresh_power = agent_module.Agent.refresh_power.__get__(self.agent)
 
@@ -509,9 +963,14 @@ class AgentTests(unittest.TestCase):
         self.agent.lid_dimming = True
         self.agent.lid_closed = True
         self.agent.dim_brightness()
-        self.agent.brightness_adapter.writes.clear()
+        adapter = self.agent.brightness_adapter
+        adapter.writes.clear()
+        self.agent.refresh_brightness_capability.side_effect = lambda trigger: (
+            setattr(self.agent, 'brightness_adapter', adapter),
+            setattr(self.agent, 'brightness_available', True),
+            self.agent.reconcile_brightness(trigger))
         self.agent.on_owner_change(agent_module.BRIGHTNESS, '', ':1.power')
-        self.assertEqual(self.agent.brightness_adapter.writes, [70, 0])
+        self.assertEqual(adapter.writes, [70, 0])
 
     def test_service_loss_and_return_closed_lid_ends_dimmed(self):
         self.agent.enabled = True
@@ -521,9 +980,10 @@ class AgentTests(unittest.TestCase):
         adapter = self.agent.brightness_adapter
         adapter.writes.clear()
         self.agent.on_owner_change(agent_module.BRIGHTNESS, ':1.old', '')
-        self.agent.refresh_brightness_capability.side_effect = lambda: (
+        self.agent.refresh_brightness_capability.side_effect = lambda trigger: (
             setattr(self.agent, 'brightness_adapter', adapter),
-            setattr(self.agent, 'brightness_available', True))
+            setattr(self.agent, 'brightness_available', True),
+            self.agent.reconcile_brightness(trigger))
         self.agent.on_owner_change(agent_module.BRIGHTNESS, '', ':1.new')
         self.assertEqual(adapter.writes, [70, 0])
         self.assertEqual(adapter.value, 0)
@@ -537,9 +997,10 @@ class AgentTests(unittest.TestCase):
         adapter.writes.clear()
         self.agent.on_owner_change(agent_module.BRIGHTNESS, ':1.old', '')
         self.agent.lid_closed = False
-        self.agent.refresh_brightness_capability.side_effect = lambda: (
+        self.agent.refresh_brightness_capability.side_effect = lambda trigger: (
             setattr(self.agent, 'brightness_adapter', adapter),
-            setattr(self.agent, 'brightness_available', True))
+            setattr(self.agent, 'brightness_available', True),
+            self.agent.reconcile_brightness(trigger))
         self.agent.on_owner_change(agent_module.BRIGHTNESS, '', ':1.new')
         self.assertEqual(adapter.writes, [70])
         self.assertEqual(adapter.value, 70)
@@ -633,6 +1094,7 @@ class AgentTests(unittest.TestCase):
         self.agent.brightness_journal_state = 'absent'
         self.agent.property = mock.Mock(side_effect=[False, True, True])
         self.agent.proxy = mock.Mock(return_value=types.SimpleNamespace(
+            GetNameOwner=mock.Mock(return_value=':1.upower'),
             EnumerateDevices=mock.Mock(return_value=[])))
         self.agent.refresh_power = agent_module.Agent.refresh_power.__get__(self.agent)
 
@@ -691,6 +1153,37 @@ class AgentTests(unittest.TestCase):
         self.assertEqual(gnome.Uninhibit.call_count, 3)
         bus.close.assert_called_once()
         self.assertTrue(self.agent.exit_failure)
+
+    def test_disconnect_closes_cookie_bus_when_publication_fails(self):
+        self.held_cookie()
+        bus = types.SimpleNamespace(close=mock.Mock())
+        self.agent.session_bus = bus
+        self.agent.publish.side_effect = RuntimeError('signal publication failed')
+        self.agent.fd = 91
+        self.agent.lid_fd = 92
+        with mock.patch.object(agent_module.os, 'close') as close:
+            self.agent.disconnect_session_bus('unknown acquisition outcome')
+        bus.close.assert_called_once()
+        self.assertEqual({call.args[0] for call in close.call_args_list}, {91, 92})
+        self.assertIsNone(self.agent.fd)
+        self.assertIsNone(self.agent.lid_fd)
+        self.assertTrue(self.agent.shutting_down)
+        self.assertEqual(self.agent.session_cookie_state, 'absent')
+        self.assertTrue(self.agent.exit_failure)
+        self.agent.loop.quit.assert_called_once()
+
+    def test_disconnect_closes_local_inhibitors_even_when_bus_close_fails(self):
+        bus = types.SimpleNamespace(close=mock.Mock(side_effect=OSError('bus close failed')))
+        self.agent.session_bus = bus
+        self.agent.fd = 91
+        self.agent.lid_fd = 92
+        with mock.patch.object(agent_module.os, 'close') as close:
+            self.agent.disconnect_session_bus('release uncertain')
+        self.assertEqual({call.args[0] for call in close.call_args_list}, {91, 92})
+        self.assertIsNone(self.agent.fd)
+        self.assertIsNone(self.agent.lid_fd)
+        self.assertTrue(self.agent.exit_failure)
+        self.agent.loop.quit.assert_called_once()
 
     def test_owner_loss_cancels_release_source(self):
         self.held_cookie()
@@ -782,7 +1275,7 @@ class AgentTests(unittest.TestCase):
 
     def test_duplicate_true_preserves_original_baseline(self):
         self.agent.preparing_for_sleep.return_value = True
-        with mock.patch.object(agent_module, 'boottime', side_effect=[10, 15]),                 mock.patch.object(agent_module.time, 'monotonic', side_effect=[10, 15]):
+        with mock.patch.object(agent_module, 'boottime', side_effect=[10, 15]),                 mock.patch.object(agent_module.time, 'monotonic', side_effect=[10, 10, 15, 15]):
             self.agent.observe_prepare_enter()
             baseline = self.agent.sleep_tx['gap_baseline']
             self.agent.observe_prepare_enter()
@@ -1079,7 +1572,7 @@ class AgentTests(unittest.TestCase):
         self.agent.sleep_now = mock.Mock()
         with mock.patch.object(agent_module, 'boottime', return_value=0), \
                 mock.patch.object(agent_module.time, 'monotonic', return_value=0):
-            self.agent.StartTimer(60, False, False)
+            self.agent.StartTimer(60, False, False, reply=mock.Mock(), error=mock.Mock())
             self.agent.tick()
         self.agent.enabled = True
         self.agent.failsafe = True
@@ -1094,8 +1587,9 @@ class AgentTests(unittest.TestCase):
     def test_reentrant_wake_resolution_is_not_resurrected_by_method_reply(self):
         self.configure_low_battery()
         self.agent.release = mock.Mock(return_value=True)
-        def suspend(_interactive):
+        def suspend(_interactive, **kwargs):
             self.agent.resolve_sleep_transaction('proven-resume', now=10, monotonic_now=0)
+            kwargs['reply_handler']()
         login = types.SimpleNamespace(Suspend=mock.Mock(side_effect=suspend))
         self.agent.proxy = mock.Mock(return_value=login)
         self.assertTrue(self.agent.sleep_now('Battery fell below the failsafe threshold'))
@@ -1107,8 +1601,8 @@ class AgentTests(unittest.TestCase):
         self.configure_low_battery()
         self.agent.release = mock.Mock(return_value=True)
         login = types.SimpleNamespace(
-            Suspend=mock.Mock(side_effect=lambda _interactive:
-                              self.agent.observe_prepare_enter()))
+            Suspend=mock.Mock(side_effect=lambda _interactive, **kwargs: (
+                self.agent.observe_prepare_enter(), kwargs['reply_handler']())))
         self.agent.proxy = mock.Mock(return_value=login)
         self.assertTrue(self.agent.sleep_now('Battery fell below the failsafe threshold'))
         self.assertEqual(self.agent.sleep_tx['phase'], 'preparing')
@@ -1204,7 +1698,11 @@ class AgentTests(unittest.TestCase):
         a.proxy = mock.Mock(return_value=login)
         self.assertTrue(a.sleep_now('Countdown elapsed'))
         a.tick()
-        login.Suspend.assert_called_once_with(False)
+        login.Suspend.assert_called_once()
+        self.assertEqual(login.Suspend.call_args.args, (False,))
+        self.assertEqual(login.Suspend.call_args.kwargs['timeout'], 3)
+        self.assertTrue(callable(login.Suspend.call_args.kwargs['reply_handler']))
+        self.assertTrue(callable(login.Suspend.call_args.kwargs['error_handler']))
         self.assertIsNone(a.deadline)
         self.assertEqual(a.timer_phase, 'consumed')
         self.assertFalse(a.enabled)
@@ -1281,7 +1779,11 @@ class AgentTests(unittest.TestCase):
         self.assertFalse(self.agent.enabled)
         self.agent.refresh_power.assert_called_once_with(reconcile_lid=False)
         agent_module.Agent.check_failsafe(self.agent)
-        login.Suspend.assert_called_once_with(False)
+        login.Suspend.assert_called_once()
+        self.assertEqual(login.Suspend.call_args.args, (False,))
+        self.assertEqual(login.Suspend.call_args.kwargs['timeout'], 3)
+        self.assertTrue(callable(login.Suspend.call_args.kwargs['reply_handler']))
+        self.assertTrue(callable(login.Suspend.call_args.kwargs['error_handler']))
         self.assertTrue(self.agent.failsafe_triggered)
 
     def test_failsafe_power_change_during_final_logind_read_blocks_dispatch(self):
@@ -1343,7 +1845,7 @@ class AgentTests(unittest.TestCase):
     def test_proven_suspend_consumes_overdue_active_timer_without_resuspend(self):
         self.agent.deadline = 5
         self.agent.timer_phase = 'running'
-        self.agent.clock_gap = 0
+        self.agent.clock_gap = agent_module.ClockGapSample(0, 0, 0, 0)
         self.agent.preparing_for_sleep.return_value = False
         self.agent.proxy = mock.Mock()
         with mock.patch.object(agent_module, 'boottime', return_value=20),                 mock.patch.object(agent_module.time, 'monotonic', return_value=10):
@@ -1367,13 +1869,15 @@ class AgentTests(unittest.TestCase):
 
     def power_devices(self, devices):
         self.agent.property = mock.Mock(side_effect=[True, True, False, 5])
-        manager = types.SimpleNamespace(EnumerateDevices=lambda: list(range(len(devices))),
-                                       GetDisplayDevice=lambda: '/display')
+        manager = types.SimpleNamespace(EnumerateDevices=lambda **_kwargs: list(range(len(devices))),
+                                       GetDisplayDevice=lambda **_kwargs: '/display')
         def proxy(_bus, _name, path, _interface):
+            if path == '/org/freedesktop/DBus':
+                return types.SimpleNamespace(GetNameOwner=lambda *_args, **_kwargs: ':1.upower')
             if path == agent_module.UPOWER_PATH:
                 return manager
             result = devices[path]
-            def get_all(_interface):
+            def get_all(_interface, **_kwargs):
                 if isinstance(result, Exception):
                     raise result
                 return dict(Type=2, PowerSupply=True, IsPresent=True,
@@ -1387,7 +1891,7 @@ class AgentTests(unittest.TestCase):
                  ([3], 'unknown'), ([2], 'discharging'), ([1, 4, 5], 'not-discharging'),
                  ([1, 0], 'unknown'), ([2, 0], 'discharging'),
                  ([1, FakeDBusException('missing')], 'unknown'),
-                 ([2, FakeDBusException('missing')], 'discharging')]
+                 ([2, FakeDBusException('missing')], 'unknown')]
         for devices, expected in cases:
             with self.subTest(devices=devices):
                 self.power_devices(devices)
@@ -1433,6 +1937,12 @@ class AgentTests(unittest.TestCase):
                 agent_module.data_home()
         with mock.patch.dict(agent_module.os.environ, {'XDG_STATE_HOME': ''}):
             self.assertEqual(agent_module.data_home(), Path.home() / '.local/state/sleep-disabler')
+        for unsafe in ('/tmp/bad\nstate', '/tmp/bad\tstate', '/tmp/bad\x7fstate',
+                       '/tmp/bad\x85state', '/tmp/bad\u200bstate'):
+            with self.subTest(unsafe=repr(unsafe)), \
+                    mock.patch.dict(agent_module.os.environ, {'XDG_STATE_HOME': unsafe}):
+                with self.assertRaises(ValueError):
+                    agent_module.data_home()
 
     def test_unknown_low_battery_sequences_cannot_dispatch_twice(self):
         for ambiguous in (0, 6, [], FakeDBusException('UPower gone')):
@@ -1502,12 +2012,23 @@ class AgentTests(unittest.TestCase):
         self.assertTrue(self.agent.failsafe)
 
     def test_panel_registration_is_versioned_and_sender_owned(self):
+        names = types.SimpleNamespace(GetNameOwner=mock.Mock(
+            side_effect=lambda _name, **kwargs: kwargs['reply_handler'](':1.42')))
+        self.agent.proxy = mock.Mock(return_value=names)
+        reply, error = mock.Mock(), mock.Mock()
+        def register(version, sender=':1.42'):
+            self.agent.RegisterPanelRuntime(version, sender=sender, reply=reply, error=error)
         self.assertFalse(self.agent.state()['panelRuntimeRegistered'])
         for version in ('', '0', '1bad', '1.2.3.4', ' 5', '5\n'):
             with self.assertRaises(FakeDBusException):
-                self.agent.RegisterPanelRuntime(version, sender=':1.42')
-        self.agent.RegisterPanelRuntime('5', sender=':1.42')
+                register(version)
+        register('5')
+        reply.assert_called_once_with()
+        error.assert_not_called()
         self.assertEqual(self.agent.state()['panelRuntimeVersion'], '5')
+        with mock.patch.object(self.agent, 'publish') as publish:
+            register('5')
+            publish.assert_not_called()
         self.agent.UnregisterPanelRuntime('5', sender=':1.43')
         self.agent.UnregisterPanelRuntime('4', sender=':1.42')
         self.assertTrue(self.agent.state()['panelRuntimeRegistered'])
@@ -1515,11 +2036,104 @@ class AgentTests(unittest.TestCase):
         self.assertTrue(self.agent.state()['panelRuntimeRegistered'])
         self.agent.on_panel_owner_change(':1.42', ':1.42', '')
         self.assertFalse(self.agent.state()['panelRuntimeRegistered'])
-        self.agent.RegisterPanelRuntime('5', sender=':1.42')
+        register('5')
         self.agent.UnregisterPanelRuntime('5', sender=':1.42')
         self.assertFalse(self.agent.state()['panelRuntimeRegistered'])
-        self.assertEqual(self.agent.state()['agentRuntimeVersion'], '0.5.0')
-        self.assertEqual(self.agent.state()['apiVersion'], 5)
+        self.assertEqual(self.agent.state()['agentRuntimeVersion'], '0.6.0')
+        self.assertEqual(self.agent.state()['apiVersion'], 6)
+
+    def test_panel_registration_rejects_non_shell_and_stale_owner_replies(self):
+        names = types.SimpleNamespace(GetNameOwner=mock.Mock())
+        self.agent.proxy = mock.Mock(return_value=names)
+        reply, error = mock.Mock(), mock.Mock()
+        self.agent.RegisterPanelRuntime('6', sender=':1.42', reply=reply, error=error)
+        names.GetNameOwner.call_args.kwargs['reply_handler'](':1.other')
+        reply.assert_not_called()
+        self.assertEqual(error.call_args.args[0].get_dbus_name(), agent_module.IFACE + '.InvalidArgument')
+        self.assertFalse(self.agent.state()['panelRuntimeRegistered'])
+
+        error.reset_mock()
+        self.agent.RegisterPanelRuntime('6', sender=':1.42', reply=reply, error=error)
+        self.agent.on_owner_change(agent_module.SHELL, ':1.42', ':1.other')
+        names.GetNameOwner.call_args.kwargs['reply_handler'](':1.42')
+        reply.assert_not_called()
+        error.assert_called_once()
+        self.assertEqual(error.call_args.args[0].get_dbus_name(), agent_module.IFACE + '.Unavailable')
+        self.assertFalse(self.agent.state()['panelRuntimeRegistered'])
+
+        self.agent.RegisterPanelRuntime('6', sender=':1.42', reply=reply, error=error)
+        names.GetNameOwner.call_args.kwargs['reply_handler'](':1.42')
+        self.assertTrue(self.agent.state()['panelRuntimeRegistered'])
+        self.agent.on_owner_change(agent_module.SHELL, ':1.other', ':1.next')
+        self.assertFalse(self.agent.state()['panelRuntimeRegistered'])
+
+    def test_panel_registration_rejects_late_owner_success(self):
+        names = types.SimpleNamespace(GetNameOwner=mock.Mock())
+        self.agent.proxy = mock.Mock(return_value=names)
+        reply, error = mock.Mock(), mock.Mock()
+        with mock.patch.object(agent_module.time, 'monotonic', return_value=100):
+            self.agent.RegisterPanelRuntime('6', sender=':1.42', reply=reply, error=error)
+        owner_reply = names.GetNameOwner.call_args.kwargs['reply_handler']
+        with mock.patch.object(agent_module.time, 'monotonic', return_value=104):
+            owner_reply(':1.42')
+        reply.assert_not_called()
+        error.assert_called_once()
+        self.assertEqual(error.call_args.args[0].get_dbus_name(), agent_module.IFACE + '.Unavailable')
+        self.assertFalse(self.agent.state()['panelRuntimeRegistered'])
+        owner_reply(':1.42')
+        error.assert_called_once()
+
+    def test_panel_registration_retry_after_slow_publication_is_idempotent(self):
+        a = self.agent
+        names = types.SimpleNamespace(GetNameOwner=mock.Mock())
+        a.proxy = mock.Mock(return_value=names)
+        now = [100]
+        a.publish.side_effect = lambda: now.__setitem__(0, 104)
+        reply, error = mock.Mock(), mock.Mock()
+        with mock.patch.object(agent_module.time, 'monotonic', side_effect=lambda: now[0]):
+            a.RegisterPanelRuntime('6', sender=':1.42', reply=reply, error=error)
+            names.GetNameOwner.call_args.kwargs['reply_handler'](':1.42')
+            reply.assert_not_called()
+            error.assert_called_once()
+            self.assertTrue(a.state()['panelRuntimeRegistered'])
+            a.publish.side_effect = None
+            now[0] = 105
+            a.RegisterPanelRuntime('6', sender=':1.42', reply=reply, error=error)
+            names.GetNameOwner.call_args.kwargs['reply_handler'](':1.42')
+        reply.assert_called_once()
+        error.assert_called_once()
+        a.publish.assert_called_once()
+
+    def test_panel_unregister_cancels_pending_owner_check(self):
+        names = types.SimpleNamespace(GetNameOwner=mock.Mock())
+        self.agent.proxy = mock.Mock(return_value=names)
+        reply, error = mock.Mock(), mock.Mock()
+        self.agent.RegisterPanelRuntime('6', sender=':1.42', reply=reply, error=error)
+        owner_reply = names.GetNameOwner.call_args.kwargs['reply_handler']
+        self.agent.UnregisterPanelRuntime('6', sender=':1.other')
+        self.agent.UnregisterPanelRuntime('5', sender=':1.42')
+        error.assert_not_called()
+        self.agent.UnregisterPanelRuntime('6', sender=':1.42')
+        self.assertEqual(error.call_args.args[0].get_dbus_name(), agent_module.IFACE + '.Unavailable')
+        owner_reply(':1.42')
+        reply.assert_not_called()
+        self.assertFalse(self.agent.state()['panelRuntimeRegistered'])
+
+    def test_panel_unregister_async_reply_tracks_admission_deadline(self):
+        a = self.agent
+        reply, error = mock.Mock(), mock.Mock()
+        a.panel_runtime_sender = ':1.42'
+        a.panel_runtime_version = '6'
+        with mock.patch.object(agent_module.time, 'monotonic', side_effect=[100, 100]):
+            a.UnregisterPanelRuntime('6', sender=':1.42', reply=reply, error=error)
+        reply.assert_called_once_with()
+        error.assert_not_called()
+        self.assertEqual(a.panel_runtime_sender, '')
+        with mock.patch.object(agent_module.time, 'monotonic', side_effect=[100, 121]):
+            a.UnregisterPanelRuntime('6', sender=':1.42', reply=reply, error=error)
+        reply.assert_called_once()
+        error.assert_called_once()
+        self.assertEqual(error.call_args.args[0].get_dbus_name(), agent_module.IFACE + '.Unavailable')
 
     def test_post_replace_settings_failure_reconciles_memory(self):
         real_write = agent_module.atomic_json
@@ -1606,7 +2220,7 @@ class AgentTests(unittest.TestCase):
 
     def test_uncertain_prepared_and_applied_brightness_journals(self):
         real_write = agent_module.atomic_json
-        for fail_phase in ('prepared', 'applied'):
+        for fail_phase in ('prepared', 'set-confirmed', 'applied'):
             with self.subTest(phase=fail_phase):
                 self.agent.brightness_record = None
                 self.agent.brightness_journal_state = 'absent'
@@ -1638,11 +2252,16 @@ class AgentTests(unittest.TestCase):
         def remote_release(_cookie, **_kwargs):
             self.assertEqual(self.agent.brightness_adapter.value, 70)
             self.assertIsNone(self.agent.brightness_record)
-            self.assertTrue(self.agent.enabled)
+            self.assertFalse(self.agent.enabled)
             self.assertTrue(self.agent.shutting_down)
-            raise FakeDBusException('remote release timeout')
-        self.agent.proxy = mock.Mock(return_value=types.SimpleNamespace(Uninhibit=remote_release))
-        self.agent.session_bus = types.SimpleNamespace(close=mock.Mock())
+            _kwargs['error_handler'](FakeDBusException('remote release timeout'))
+        names = types.SimpleNamespace(GetNameOwner=lambda _name, **kwargs:
+            kwargs['reply_handler'](':1.gnome'))
+        self.agent.proxy = mock.Mock(side_effect=lambda _bus, name, *_args:
+            names if name == 'org.freedesktop.DBus' else
+            types.SimpleNamespace(Uninhibit=remote_release))
+        self.agent.session_bus = types.SimpleNamespace(get_is_connected=lambda: True,
+                                                       close=mock.Mock())
         self.agent.stop()
         self.assertFalse(fake_glib.sources)
         self.agent.stop()
@@ -1652,15 +2271,975 @@ class AgentTests(unittest.TestCase):
         with self.assertRaises(FakeDBusException):
             self.agent.StartTimer(60, False, False)
 
+    def test_repeated_dimming_enable_preserves_owned_journal_and_brightness(self):
+        self.agent.enabled = True
+        self.agent.lid_closed = True
+        self.agent.SetLidDimming(True)
+        record = json.loads(self.agent.brightness_path.read_text())
+        self.assertEqual(self.agent.brightness_state(), 'dimmed-owned')
+        self.assertEqual(self.agent.brightness_adapter.writes, [0])
+        with mock.patch.object(agent_module, 'atomic_json', wraps=agent_module.atomic_json) as write:
+            self.agent.SetLidDimming(True)
+        self.assertEqual(self.agent.brightness_adapter.writes, [0])
+        self.assertEqual(json.loads(self.agent.brightness_path.read_text()), record)
+        self.assertEqual(write.call_count, 0)
+        self.assertEqual(self.agent.brightness_state(), 'dimmed-owned')
+
+    def test_remote_open_lid_dimming_toggle_has_no_brightness_call(self):
+        a = self.agent
+        a.enabled = True
+        a.lid_closed = False
+        a.reconcile_brightness = mock.Mock(side_effect=AssertionError('blocking reconciliation'))
+        a.brightness_adapter.read = mock.Mock(side_effect=AssertionError('blocking read'))
+        a.brightness_adapter.write = mock.Mock(side_effect=AssertionError('blocking write'))
+        replies, failures = [], []
+        a.SetLidDimming(True, reply=lambda: replies.append('on'), error=failures.append)
+        a.SetLidDimming(False, reply=lambda: replies.append('off'), error=failures.append)
+        self.assertEqual(replies, ['on', 'off'])
+        self.assertEqual(failures, [])
+        self.assertFalse(fake_glib.sources)
+
+    def test_remote_repeated_dimming_enable_waits_for_bounded_read(self):
+        a = self.agent
+        a.enabled = a.lid_closed = True
+        a.SetLidDimming(True)
+        record = json.loads(a.brightness_path.read_text())
+        pending = []
+        a.brightness_adapter.read_async = lambda callback, **_kwargs: pending.append(callback)
+        replied, failed = [], []
+        with mock.patch.object(agent_module, 'atomic_json', wraps=agent_module.atomic_json) as write:
+            a.SetLidDimming(True, reply=lambda: replied.append(True),
+                            error=lambda issue: failed.append(issue))
+            self.assertEqual((replied, failed), ([], []))
+            self.assertEqual(len(pending), 1)
+            pending.pop()(0, None)
+            self.assertEqual((replied, failed), ([True], []))
+            self.assertEqual(write.call_count, 0)
+        self.assertEqual(a.brightness_adapter.writes, [0])
+        self.assertEqual(json.loads(a.brightness_path.read_text()), record)
+
+    def test_repeated_dimming_verification_counts_admission_work(self):
+        a = self.agent
+        a.enabled = a.lid_closed = True
+        a.SetLidDimming(True)
+        now = [100]
+        brightness_state = a.brightness_state
+        def slow_brightness_state():
+            now[0] = 121
+            return brightness_state()
+        a.brightness_state = slow_brightness_state
+        a.brightness_adapter.read_async = mock.Mock()
+        replied, failed = [], []
+        with mock.patch.object(agent_module.time, 'monotonic', side_effect=lambda: now[0]):
+            a.SetLidDimming(True, reply=lambda: replied.append(True), error=failed.append)
+        self.assertEqual(replied, [])
+        self.assertEqual(len(failed), 1)
+        self.assertEqual(failed[0].get_dbus_name(), agent_module.IFACE + '.Unavailable')
+        a.brightness_adapter.read_async.assert_not_called()
+        self.assertIsNone(a.dimming_verification)
+
+    def test_remote_repeated_dimming_enable_timeout_retains_journal(self):
+        a = self.agent
+        a.enabled = a.lid_closed = True
+        a.SetLidDimming(True)
+        record = json.loads(a.brightness_path.read_text())
+        pending = []
+        a.brightness_adapter.read_async = lambda callback: pending.append(callback)
+        replied, failed = [], []
+        a.SetLidDimming(True, reply=lambda: replied.append(True),
+                        error=lambda issue: failed.append(issue))
+        source = max(fake_glib.sources)
+        fake_glib.sources[source][1]()
+        pending.pop()(0, None)
+        self.assertEqual(replied, [])
+        self.assertEqual(len(failed), 1)
+        self.assertTrue(a.brightness_recovery_pending())
+        self.assertEqual(json.loads(a.brightness_path.read_text()), record)
+        self.assertEqual(a.brightness_adapter.writes, [0])
+
+    def test_remote_repeated_dimming_enable_late_success_is_timeout(self):
+        a = self.agent
+        a.enabled = a.lid_closed = True
+        a.SetLidDimming(True)
+        pending = []
+        a.brightness_adapter.read_async = lambda callback: pending.append(callback)
+        replied, failed = [], []
+        a.SetLidDimming(True, reply=lambda: replied.append(True),
+                        error=lambda issue: failed.append(issue))
+        a.dimming_verification['deadline'] = agent_module.time.monotonic() - 1
+        pending.pop()(0, None)
+        self.assertEqual(replied, [])
+        self.assertEqual(len(failed), 1)
+        self.assertTrue(a.brightness_recovery_pending())
+        self.assertEqual(a.brightness_adapter.writes, [0])
+        self.assertIsNone(a.dimming_verification)
+
+    def test_remote_repeated_dimming_enable_rejects_stale_owner(self):
+        a = self.agent
+        a.enabled = a.lid_closed = True
+        a.SetLidDimming(True)
+        pending = []
+        a.brightness_adapter.read_async = lambda callback: pending.append(callback)
+        replied, failed = [], []
+        a.SetLidDimming(True, reply=lambda: replied.append(True),
+                        error=lambda issue: failed.append(issue))
+        a.brightness_adapter = FakeBrightness(value=0)
+        pending.pop()(0, None)
+        self.assertEqual(replied, [])
+        self.assertEqual(len(failed), 1)
+        self.assertTrue(a.brightness_recovery_pending())
+        self.assertEqual(a.dimming_verifications, set())
+
+    def test_brightness_owner_loss_immediately_invalidates_pending_verification(self):
+        a = self.agent
+        a.enabled = a.lid_closed = True
+        a.SetLidDimming(True)
+        pending = []
+        a.brightness_adapter.read_async = lambda callback: pending.append(callback)
+        replied, failed = [], []
+        a.SetLidDimming(True, reply=lambda: replied.append(True), error=failed.append)
+        with mock.patch.object(a, 'reconcile_brightness_async'):
+            a.on_owner_change(agent_module.BRIGHTNESS, ':1.old', '')
+        self.assertEqual(replied, [])
+        self.assertEqual(len(failed), 1)
+        self.assertTrue(a.brightness_recovery_pending())
+        self.assertIsNone(a.dimming_verification)
+        pending.pop()(0, None)
+        self.assertEqual(len(failed), 1)
+
+    def test_remote_repeated_dimming_enable_is_canceled_by_stop(self):
+        a = self.agent
+        a.enabled = a.lid_closed = True
+        a.SetLidDimming(True)
+        pending = []
+        a.brightness_adapter.read_async = lambda callback, **_kwargs: pending.append(callback)
+        replied, failed = [], []
+        a.SetLidDimming(True, reply=lambda: replied.append(True),
+                        error=lambda issue: failed.append(issue))
+        a.release_async = lambda callback, **_kwargs: callback(True)
+        a.loop = types.SimpleNamespace(quit=lambda: None)
+        a.stop()
+        pending.pop()(0, None)
+        self.assertEqual(replied, [])
+        self.assertEqual(len(failed), 1)
+        self.assertEqual(a.dimming_verifications, set())
+
+    def test_remote_repeated_dimming_enable_coalesces_waiters(self):
+        a = self.agent
+        a.enabled = a.lid_closed = True
+        a.SetLidDimming(True)
+        pending = []
+        a.brightness_adapter.read_async = lambda callback: pending.append(callback)
+        replied, failed = [], []
+        for index in (1, 2):
+            a.SetLidDimming(True, reply=lambda index=index: replied.append(index),
+                            error=lambda issue: failed.append(issue))
+        self.assertEqual(len(pending), 1)
+        pending.pop()(0, None)
+        self.assertEqual(replied, [1, 2])
+        self.assertEqual(failed, [])
+        self.assertIsNone(a.dimming_verification)
+
+    def test_disable_supersedes_pending_remote_dimming_verification(self):
+        a = self.agent
+        a.enabled = a.lid_closed = True
+        a.SetLidDimming(True)
+        pending = []
+        a.brightness_adapter.read_async = lambda callback: pending.append(callback)
+        replied, failed = [], []
+        a.SetLidDimming(True, reply=lambda: replied.append(True),
+                        error=lambda issue: failed.append(issue))
+        a.SetLidDimming(False)
+        pending.pop()(0, None)
+        self.assertEqual(replied, [])
+        self.assertEqual(len(failed), 1)
+        self.assertEqual(a.brightness_adapter.value, 70)
+        self.assertIsNone(a.dimming_verification)
+
+    def test_remote_dimming_verification_rechecks_journal_after_read(self):
+        a = self.agent
+        a.enabled = a.lid_closed = True
+        a.SetLidDimming(True)
+        pending = []
+        a.brightness_adapter.read_async = lambda callback: pending.append(callback)
+        replied, failed = [], []
+        a.SetLidDimming(True, reply=lambda: replied.append(True),
+                        error=lambda issue: failed.append(issue))
+        changed = json.loads(a.brightness_path.read_text())
+        changed['before'] = 60
+        a.brightness_path.write_text(json.dumps(changed))
+        pending.pop()(0, None)
+        self.assertEqual(replied, [])
+        self.assertEqual(len(failed), 1)
+        self.assertTrue(a.brightness_recovery_pending())
+
+    def test_repeated_dimming_enable_rejects_changed_output(self):
+        self.agent.enabled = True
+        self.agent.lid_closed = True
+        self.agent.SetLidDimming(True)
+        journal = self.agent.brightness_path.read_text()
+        self.agent.brightness_adapter.output_identity = lambda: 'another-output'
+        with self.assertRaises(FakeDBusException):
+            self.agent.SetLidDimming(True)
+        self.assertEqual(self.agent.brightness_adapter.writes, [0])
+        self.assertEqual(self.agent.brightness_path.read_text(), journal)
+        self.assertTrue(self.agent.brightness_recovery_pending())
+
+    def test_manual_brightness_conflict_can_be_explicitly_rearmed(self):
+        self.agent.enabled = True
+        self.agent.lid_closed = True
+        self.agent.SetLidDimming(True)
+        self.agent.brightness_adapter.value = 35
+        self.assertEqual(self.agent.restore_brightness(), 'manual-change-preserved')
+        self.assertEqual(self.agent.brightness_state(), 'manual-change-preserved')
+        with mock.patch.object(agent_module, 'atomic_json', wraps=agent_module.atomic_json) as write:
+            self.agent.SetLidDimming(True)
+        self.assertEqual(self.agent.brightness_adapter.writes, [0, 0])
+        self.assertEqual(self.agent.brightness_state(), 'dimmed-owned')
+        self.assertEqual(write.call_count, 3)  # Prepared, Set-confirmed, applied; no preference rewrite.
+
+    def test_notification_dispatch_never_waits_for_remote_reply(self):
+        bus = types.SimpleNamespace(get_is_connected=lambda: True)
+        self.agent.session_bus = bus
+        remote = mock.Mock()
+        self.agent.proxy = mock.Mock(return_value=remote)
+        agent_module.Agent.notify(self.agent, 'Summary', 'Body')
+        call = remote.Notify.call_args
+        self.assertEqual(call.kwargs['timeout'], 2)
+        self.assertTrue(call.kwargs['reply_handler'])
+        self.assertTrue(call.kwargs['error_handler'])
+        self.agent.shutting_down = True
+        agent_module.Agent.notify(self.agent, 'Summary', 'Body')
+        remote.Notify.assert_called_once()
+
+    def test_repeated_prevention_enable_keeps_healthy_inhibitors(self):
+        a = self.agent
+        a.session_cookie = 7
+        a.session_cookie_state = 'held'
+        a.session_cookie_owner = ':1.gnome'
+        a.fd = 42
+        a.enabled = True
+        a.proxy = mock.Mock(side_effect=AssertionError('duplicate remote inhibitor'))
+        a.SetPrevention(True)
+        self.assertEqual(a.session_cookie, 7)
+        self.assertEqual(a.fd, 42)
+        self.assertTrue(a.desired)
+        a.session_manager_owner.assert_called_once()
+        a.refresh_power.assert_called_once()
+        a.check_failsafe.assert_called_once()
+
+    def test_healthy_prevention_repetition_clears_only_prevention_error(self):
+        a = self.agent
+        a.session_cookie = 7
+        a.session_cookie_state = 'held'
+        a.session_cookie_owner = ':1.gnome'
+        a.fd = 42
+        a.enabled = True
+        a.last_error = 'GNOME inhibitor ownership is unresolved; wait for recovery before enabling'
+        a.SetPrevention(True)
+        self.assertEqual(a.last_error, '')
+        a.last_error = 'Brightness recovery pending: display unavailable'
+        a.SetPrevention(True)
+        self.assertEqual(a.last_error, 'Brightness recovery pending: display unavailable')
+
+    def test_prevention_dimming_verification_marks_stale_adapter_pending(self):
+        a = self.agent
+        a.enabled = a.lid_dimming = a.lid_closed = True
+        self.assertEqual(a.dim_brightness(), 'redimmed')
+        old_adapter = a.brightness_adapter
+        old_adapter.read_async = mock.Mock()
+        results = []
+        agent_module.Agent.reconcile_brightness_async(
+            a, 'prevention-enable', results.append)
+        callback = old_adapter.read_async.call_args.args[0]
+        a.brightness_adapter = FakeBrightness()
+        callback(0, None)
+        self.assertEqual(results, ['pending'])
+        self.assertTrue(a.brightness_retry_pending)
+        self.assertTrue(a.brightness_recovery_pending())
+        self.assertIn('adapter changed', a.brightness_error)
+
+    def test_concurrent_prevention_enable_coalesces_owner_lookup(self):
+        a = self.agent
+        a.session_bus = types.SimpleNamespace(get_is_connected=lambda: True,
+                                              close=mock.Mock())
+        names = mock.Mock()
+        a.proxy = mock.Mock(return_value=names)
+        first, second = [], []
+        a.SetPrevention(True, reply=lambda: first.append('ok'), error=first.append)
+        a.SetPrevention(True, reply=lambda: second.append('ok'), error=second.append)
+        names.GetNameOwner.assert_called_once()
+        names.GetNameOwner.call_args.kwargs['error_handler'](
+            FakeDBusException('session manager unavailable'))
+        self.assertEqual(len(first), 1)
+        self.assertEqual(len(second), 1)
+        self.assertIsInstance(first[0], FakeDBusException)
+        self.assertIsInstance(second[0], FakeDBusException)
+        self.assertIsNone(a.prevention_acquisition)
+
+    def test_remote_healthy_prevention_repetition_rechecks_fresh_power(self):
+        a = self.agent
+        a.session_cookie = 7
+        a.session_cookie_state = 'held'
+        a.session_cookie_owner = ':1.gnome'
+        a.fd = 42
+        a.sleep_fd_owner = ':1.login'
+        a.enabled = True
+        names = types.SimpleNamespace(GetNameOwner=mock.Mock(side_effect=lambda name, **kwargs:
+            kwargs['reply_handler'](':1.gnome' if name == agent_module.SESSION else ':1.login')))
+        a.proxy = mock.Mock(return_value=names)
+        a.acquire_async = mock.Mock(side_effect=AssertionError('healthy pair was reacquired'))
+        a.check_failsafe = mock.Mock(side_effect=lambda callback: callback('clear'))
+        a.reconcile_brightness_async = mock.Mock(side_effect=lambda _reason, callback:
+                                                 callback('unchanged'))
+        replies, errors = [], []
+        with mock.patch.object(agent_module.os, 'fstat', return_value=object()):
+            a.SetPrevention(True, reply=lambda: replies.append('ok'), error=errors.append)
+        self.assertEqual(replies, ['ok'])
+        self.assertEqual(errors, [])
+        self.assertEqual(names.GetNameOwner.call_count, 2)
+        a.refresh_power_async.assert_called_once()
+        a.check_failsafe.assert_called_once()
+        a.acquire_async.assert_not_called()
+        self.assertEqual(a.session_cookie, 7)
+        self.assertEqual(a.fd, 42)
+
+    def test_partial_prevention_ownership_releases_without_new_acquisition(self):
+        a = self.agent
+        a.session_cookie = 7
+        a.session_cookie_state = 'release-pending'
+        a.session_cookie_owner = ':1.gnome'
+        a.acquire_async = mock.Mock(side_effect=AssertionError('partial pair was reacquired'))
+        a.release_async = mock.Mock(side_effect=lambda callback: callback(False))
+        replies, errors = [], []
+        a.SetPrevention(True, reply=lambda: replies.append('ok'), error=errors.append)
+        self.assertEqual(replies, [])
+        self.assertEqual(len(errors), 1)
+        self.assertEqual(errors[0].get_dbus_name(), agent_module.IFACE + '.ReleasePending')
+        a.release_async.assert_called_once()
+        a.acquire_async.assert_not_called()
+        self.assertFalse(a.desired)
+
+    def test_shutdown_rejects_new_prevention_request_without_acquisition(self):
+        a = self.agent
+        a.shutting_down = True
+        a.acquire_async = mock.Mock()
+        with self.assertRaises(FakeDBusException) as failure:
+            a.SetPrevention(True, reply=mock.Mock(), error=mock.Mock())
+        self.assertEqual(failure.exception.get_dbus_name(),
+                         agent_module.IFACE + '.Unavailable')
+        a.acquire_async.assert_not_called()
+
+    def test_prevention_off_wins_pending_owner_lookup(self):
+        a = self.agent
+        a.session_bus = types.SimpleNamespace(get_is_connected=lambda: True,
+                                              close=mock.Mock())
+        names = mock.Mock()
+        a.proxy = mock.Mock(return_value=names)
+        enabled, disabled = [], []
+        a.SetPrevention(True, reply=lambda: enabled.append('ok'), error=enabled.append)
+        owner_reply = names.GetNameOwner.call_args.kwargs['reply_handler']
+        a.SetPrevention(False, reply=lambda: disabled.append('ok'), error=disabled.append)
+        self.assertEqual(disabled, ['ok'])
+        self.assertEqual(len(enabled), 1)
+        self.assertEqual(enabled[0].get_dbus_name(), agent_module.IFACE + '.Canceled')
+        owner_reply(':1.gnome')
+        names.GetNameOwner.assert_called_once()
+        self.assertFalse(a.desired)
+        self.assertFalse(a.enabled)
+        a.session_bus.close.assert_not_called()
+
+    def test_prevention_off_deadline_includes_canceling_pending_enable(self):
+        a = self.agent
+        now = [100]
+        a.prevention_enable_requests.add(lambda _failure: now.__setitem__(0, 121))
+        a.release_async = mock.Mock(side_effect=lambda callback: callback(True))
+        replied, failed = [], []
+        with mock.patch.object(agent_module.time, 'monotonic', side_effect=lambda: now[0]):
+            a.SetPrevention(False, reply=lambda: replied.append(True), error=failed.append)
+        self.assertEqual(replied, [])
+        self.assertEqual(len(failed), 1)
+        self.assertEqual(failed[0].get_dbus_name(), agent_module.IFACE + '.Unavailable')
+        self.assertFalse(a.desired)
+        a.release_async.assert_called_once()
+
+    def test_late_fresh_power_does_not_start_prevention_failsafe_work(self):
+        a = self.agent
+        power_callbacks, replied, failed = [], [], []
+        a.acquire_async = lambda callback: (setattr(a, 'enabled', True), callback(None))
+        a.refresh_power_async = mock.Mock(side_effect=lambda callback, **_kwargs:
+                                          power_callbacks.append(callback))
+        with mock.patch.object(agent_module.time, 'monotonic', return_value=100):
+            a.SetPrevention(True, reply=lambda: replied.append(True), error=failed.append)
+        with mock.patch.object(agent_module.time, 'monotonic', return_value=121):
+            power_callbacks.pop()(True)
+        a.check_failsafe.assert_not_called()
+        self.assertEqual(replied, [])
+        self.assertEqual(len(failed), 1)
+        self.assertEqual(failed[0].get_dbus_name(), agent_module.IFACE + '.Unavailable')
+
+    def test_late_failsafe_result_does_not_start_brightness_work(self):
+        a = self.agent
+        failsafe_callbacks, replied, failed = [], [], []
+        a.acquire_async = lambda callback: (setattr(a, 'enabled', True), callback(None))
+        a.check_failsafe = mock.Mock(side_effect=lambda callback:
+                                     failsafe_callbacks.append(callback))
+        a.reconcile_brightness_async = mock.Mock()
+        with mock.patch.object(agent_module.time, 'monotonic', return_value=100):
+            a.SetPrevention(True, reply=lambda: replied.append(True), error=failed.append)
+        self.assertEqual(len(failsafe_callbacks), 1)
+        with mock.patch.object(agent_module.time, 'monotonic', return_value=121):
+            failsafe_callbacks.pop()('clear')
+        a.reconcile_brightness_async.assert_not_called()
+        self.assertEqual(replied, [])
+        self.assertEqual(len(failed), 1)
+        self.assertEqual(failed[0].get_dbus_name(), agent_module.IFACE + '.Unavailable')
+
+    def test_late_healthy_prevention_owner_replies_do_not_start_fresh_power(self):
+        for late_stage in ('gnome', 'login', 'owner-error'):
+            with self.subTest(late_stage=late_stage):
+                a = self.agent
+                a.session_cookie = 7
+                a.session_cookie_state = 'held'
+                a.session_cookie_owner = ':1.gnome'
+                a.fd = 42
+                a.sleep_fd_owner = ':1.login'
+                a.enabled = True
+                a.desired = False
+                callbacks, error_callbacks = [], []
+                names = types.SimpleNamespace(GetNameOwner=mock.Mock(
+                    side_effect=lambda _name, **kwargs: (
+                        callbacks.append(kwargs['reply_handler']),
+                        error_callbacks.append(kwargs['error_handler']))))
+                a.proxy = mock.Mock(return_value=names)
+                a.refresh_power_async = mock.Mock()
+                a.release_async = mock.Mock()
+                replied, failed = [], []
+                with mock.patch.object(agent_module.os, 'fstat', return_value=object()), \
+                        mock.patch.object(agent_module.time, 'monotonic', return_value=100):
+                    a.SetPrevention(True, reply=lambda: replied.append(True), error=failed.append)
+                    self.assertEqual(len(callbacks), 1)
+                    if late_stage == 'login':
+                        callbacks.pop(0)(':1.gnome')
+                        self.assertEqual(len(callbacks), 1)
+                with mock.patch.object(agent_module.time, 'monotonic', return_value=121):
+                    if late_stage == 'owner-error':
+                        error_callbacks.pop(0)(FakeDBusException('owner lost',
+                            name='org.freedesktop.DBus.Error.NameHasNoOwner'))
+                    else:
+                        callbacks.pop(0)(':1.gnome' if late_stage == 'gnome' else ':1.login')
+                self.assertEqual(names.GetNameOwner.call_count,
+                                 2 if late_stage == 'login' else 1)
+                a.refresh_power_async.assert_not_called()
+                a.release_async.assert_not_called()
+                self.assertEqual(replied, [])
+                self.assertEqual(len(failed), 1)
+                self.assertEqual(failed[0].get_dbus_name(), agent_module.IFACE + '.Unavailable')
+
+    def test_lid_mode_disable_reports_elapsed_local_budget(self):
+        a = self.agent
+        now = [100]
+        persist = a.persist_settings
+        def slow_persist(**values):
+            persist(**values)
+            now[0] = 121
+        a.persist_settings = slow_persist
+        replied, failed = [], []
+        with mock.patch.object(agent_module.time, 'monotonic', side_effect=lambda: now[0]):
+            a.SetLidMode(False, reply=lambda: replied.append(True), error=failed.append)
+        self.assertEqual(replied, [])
+        self.assertEqual(failed[0].get_dbus_name(), agent_module.IFACE + '.Unavailable')
+        self.assertFalse(a.lid_mode)
+
+    def test_lid_mode_disable_deadline_includes_superseding_pending_request(self):
+        a = self.agent
+        now = [100]
+        a.lid_mode_request = {'enabled': True}
+        a.finish_lid_mode_request = mock.Mock(side_effect=lambda *_args: now.__setitem__(0, 121))
+        replied, failed = [], []
+        with mock.patch.object(agent_module.time, 'monotonic', side_effect=lambda: now[0]):
+            a.SetLidMode(False, reply=lambda: replied.append(True), error=failed.append)
+        self.assertEqual(replied, [])
+        self.assertEqual(len(failed), 1)
+        self.assertEqual(failed[0].get_dbus_name(), agent_module.IFACE + '.Unavailable')
+        self.assertFalse(a.lid_mode)
+
+    def test_immediate_dimming_change_reports_elapsed_local_budget(self):
+        a = self.agent
+        now = [100]
+        persist = a.persist_settings
+        def slow_persist(**values):
+            persist(**values)
+            now[0] = 121
+        a.persist_settings = slow_persist
+        replied, failed = [], []
+        with mock.patch.object(agent_module.time, 'monotonic', side_effect=lambda: now[0]):
+            a.SetLidDimming(True, reply=lambda: replied.append(True), error=failed.append)
+        self.assertEqual(replied, [])
+        self.assertEqual(failed[0].get_dbus_name(), agent_module.IFACE + '.Unavailable')
+        self.assertTrue(a.lid_dimming)
+
+    def test_expired_dimming_admission_does_not_start_brightness_write(self):
+        a = self.agent
+        a.enabled = a.lid_closed = True
+        now = [100]
+        persist = a.persist_settings
+        def slow_persist(**values):
+            persist(**values)
+            now[0] = 121
+        a.persist_settings = slow_persist
+        a.dim_brightness_async = mock.Mock()
+        replied, failed = [], []
+        with mock.patch.object(agent_module.time, 'monotonic', side_effect=lambda: now[0]):
+            a.SetLidDimming(True, reply=lambda: replied.append(True), error=failed.append)
+        self.assertEqual(replied, [])
+        self.assertEqual(len(failed), 1)
+        self.assertEqual(failed[0].get_dbus_name(), agent_module.IFACE + '.Unavailable')
+        a.dim_brightness_async.assert_not_called()
+        self.assertTrue(a.lid_dimming)
+
+    def test_failsafe_change_reports_elapsed_local_budget(self):
+        a = self.agent
+        now = [100]
+        persist = a.persist_settings
+        def slow_persist(**values):
+            persist(**values)
+            now[0] = 121
+        a.persist_settings = slow_persist
+        replied, failed = [], []
+        with mock.patch.object(agent_module.time, 'monotonic', side_effect=lambda: now[0]):
+            a.SetFailsafe(True, 25, reply=lambda: replied.append(True), error=failed.append)
+        self.assertEqual(replied, [])
+        self.assertEqual(failed[0].get_dbus_name(), agent_module.IFACE + '.Unavailable')
+        self.assertTrue(a.failsafe)
+        self.assertEqual(a.threshold, 25)
+
+    def test_known_cookie_cleanup_does_not_disconnect_as_unknown_acquisition(self):
+        a = self.agent
+        a.desired = True
+        owners = iter((':1.gnome', FakeDBusException('owner check failed'), ':1.gnome'))
+        def next_owner():
+            result = next(owners)
+            if isinstance(result, Exception):
+                raise result
+            return result
+        a.session_manager_owner = mock.Mock(side_effect=next_owner)
+        session = types.SimpleNamespace(Inhibit=mock.Mock(return_value=agent_module.dbus.UInt32(7)),
+                                        Uninhibit=mock.Mock(return_value=None))
+        login = types.SimpleNamespace(Inhibit=mock.Mock(return_value=types.SimpleNamespace(take=lambda: 42)))
+        names = types.SimpleNamespace(GetNameOwner=mock.Mock(
+            side_effect=lambda name, **_kwargs: ':1.login' if name == agent_module.LOGIN else name))
+        a.proxy = mock.Mock(side_effect=lambda _bus, name, _path, _interface:
+                            names if name == 'org.freedesktop.DBus' else
+                            login if name == ':1.login' else session)
+        a.session_bus = types.SimpleNamespace(close=mock.Mock(), get_is_connected=lambda: True)
+        with mock.patch.object(agent_module.os, 'close') as close:
+            with self.assertRaises(FakeDBusException):
+                a.acquire()
+        session.Uninhibit.assert_called_once_with(7, timeout=3)
+        close.assert_called_once_with(42)
+        a.session_bus.close.assert_not_called()
+        self.assertEqual(a.session_cookie_state, 'absent')
+
+    def test_canceled_async_acquisition_closes_late_login_fd(self):
+        a = self.agent
+        a.desired = True
+        results, login_replies = [], []
+        def lookup(name, **kwargs):
+            owner = ':1.gnome' if name == agent_module.SESSION else ':1.login'
+            kwargs['reply_handler'](owner)
+        names = types.SimpleNamespace(GetNameOwner=mock.Mock(side_effect=lookup))
+        login = types.SimpleNamespace(Inhibit=mock.Mock(
+            side_effect=lambda *_args, **kwargs: login_replies.append(kwargs['reply_handler'])))
+        gnome = types.SimpleNamespace(Inhibit=mock.Mock())
+        a.proxy = mock.Mock(side_effect=lambda _bus, name, _path, _interface:
+                            names if name == 'org.freedesktop.DBus' else
+                            login if name == ':1.login' else gnome)
+        a.session_bus = types.SimpleNamespace(get_is_connected=lambda: True, close=mock.Mock())
+        a.acquire_async(results.append)
+        self.assertEqual(len(login_replies), 1)
+        a.cancel_prevention_acquisition('off won the race')
+        with mock.patch.object(agent_module.os, 'close') as close:
+            login_replies.pop()(types.SimpleNamespace(take=lambda: 42))
+        close.assert_called_once_with(42)
+        gnome.Inhibit.assert_not_called()
+        a.session_bus.close.assert_not_called()
+        self.assertEqual(len(results), 1)
+        self.assertIsInstance(results[0], FakeDBusException)
+        self.assertIsNone(a.prevention_acquisition)
+        self.assertIsNone(a.fd)
+
+    def test_stop_during_login_inhibit_closes_late_fd(self):
+        a = self.agent
+        a.desired = True
+        results, login_replies = [], []
+        names = types.SimpleNamespace(GetNameOwner=mock.Mock(side_effect=lambda name, **kwargs:
+            kwargs['reply_handler'](':1.gnome' if name == agent_module.SESSION else ':1.login')))
+        login = types.SimpleNamespace(Inhibit=mock.Mock(side_effect=lambda *_args, **kwargs:
+            login_replies.append(kwargs['reply_handler'])))
+        gnome = types.SimpleNamespace(Inhibit=mock.Mock())
+        a.proxy = mock.Mock(side_effect=lambda _bus, name, _path, _interface:
+                            names if name == 'org.freedesktop.DBus' else
+                            login if name == ':1.login' else gnome)
+        a.session_bus = types.SimpleNamespace(get_is_connected=lambda: True, close=mock.Mock())
+        a.acquire_async(results.append)
+        self.assertEqual(len(login_replies), 1)
+        a.stop()
+        with mock.patch.object(agent_module.os, 'close') as close:
+            login_replies.pop()(types.SimpleNamespace(take=lambda: 42))
+        close.assert_called_once_with(42)
+        gnome.Inhibit.assert_not_called()
+        a.session_bus.close.assert_not_called()
+        a.loop.quit.assert_called()
+        self.assertEqual(len(results), 1)
+        self.assertIsNone(a.fd)
+
+    def assert_stop_during_owner_lookup(self, stage):
+        a = self.agent
+        a.desired = True
+        results, owner_replies = [], []
+        names = types.SimpleNamespace(GetNameOwner=mock.Mock(
+            side_effect=lambda _name, **kwargs:
+            owner_replies.append(kwargs['reply_handler'])))
+        login = types.SimpleNamespace(Inhibit=mock.Mock())
+        gnome = types.SimpleNamespace(Inhibit=mock.Mock())
+        a.proxy = mock.Mock(side_effect=lambda _bus, name, _path, _interface:
+            names if name == 'org.freedesktop.DBus' else
+            login if name == ':1.login' else gnome)
+        a.session_bus = types.SimpleNamespace(
+            get_is_connected=lambda: True, close=mock.Mock())
+        a.acquire_async(results.append)
+        if stage == 'login':
+            owner_replies.pop()(':1.gnome')
+        self.assertEqual(len(owner_replies), 1)
+        a.stop()
+        owner_replies.pop()(':1.gnome' if stage == 'session' else ':1.login')
+        self.assertEqual(len(results), 1)
+        self.assertIsNone(a.prevention_acquisition)
+        self.assertIsNone(a.fd)
+        login.Inhibit.assert_not_called()
+        gnome.Inhibit.assert_not_called()
+        a.session_bus.close.assert_not_called()
+        a.loop.quit.assert_called()
+
+    def test_stop_during_session_owner_lookup_leaves_late_reply_inert(self):
+        self.assert_stop_during_owner_lookup('session')
+
+    def test_stop_during_login_owner_lookup_leaves_late_reply_inert(self):
+        self.assert_stop_during_owner_lookup('login')
+
+    def test_canceled_async_acquisition_closes_bus_before_late_cookie(self):
+        a = self.agent
+        a.desired = True
+        results, gnome_replies = [], []
+        def lookup(name, **kwargs):
+            kwargs['reply_handler'](':1.gnome' if name == agent_module.SESSION else ':1.login')
+        names = types.SimpleNamespace(GetNameOwner=mock.Mock(side_effect=lookup))
+        login = types.SimpleNamespace(Inhibit=mock.Mock(side_effect=lambda *_args, **kwargs:
+            kwargs['reply_handler'](types.SimpleNamespace(take=lambda: 42))))
+        gnome = types.SimpleNamespace(Inhibit=mock.Mock(side_effect=lambda *_args, **kwargs:
+            gnome_replies.append(kwargs['reply_handler'])))
+        a.proxy = mock.Mock(side_effect=lambda _bus, name, _path, _interface:
+                            names if name == 'org.freedesktop.DBus' else
+                            login if name == ':1.login' else gnome)
+        a.session_bus = types.SimpleNamespace(get_is_connected=lambda: True, close=mock.Mock())
+        with mock.patch.object(agent_module.os, 'close') as close:
+            a.acquire_async(results.append)
+            self.assertEqual(len(gnome_replies), 1)
+            a.cancel_prevention_acquisition('off won the race')
+            gnome_replies.pop()(agent_module.dbus.UInt32(7))
+        close.assert_called_once_with(42)
+        a.session_bus.close.assert_called_once()
+        self.assertEqual(len(results), 1)
+        self.assertIsInstance(results[0], FakeDBusException)
+        self.assertIsNone(a.prevention_acquisition)
+        self.assertIsNone(a.session_cookie)
+        self.assertTrue(a.exit_failure)
+
+    def prepare_unknown_acquisition_with_brightness_restore(self):
+        a = self.agent
+        a.enabled = a.lid_dimming = a.lid_closed = True
+        a.dim_brightness()
+        a.enabled = False
+        a.desired = True
+        bus = types.SimpleNamespace(get_is_connected=lambda: True, close=mock.Mock())
+        a.session_bus = bus
+        names = types.SimpleNamespace(GetNameOwner=mock.Mock(side_effect=lambda name, **kwargs:
+            kwargs['reply_handler'](':1.gnome' if name == agent_module.SESSION else ':1.login')))
+        login = types.SimpleNamespace(Inhibit=mock.Mock(side_effect=lambda *_args, **kwargs:
+            kwargs['reply_handler'](types.SimpleNamespace(take=lambda: 42))))
+        gnome = types.SimpleNamespace(Inhibit=mock.Mock())
+        a.proxy = mock.Mock(side_effect=lambda _bus, name, _path, _interface:
+            names if name == 'org.freedesktop.DBus' else
+            login if name == ':1.login' else gnome)
+        acquisition_results, restorations = [], []
+        a.acquire_async(acquisition_results.append)
+        self.assertEqual(gnome.Inhibit.call_count, 1)
+        a.restore_brightness_async = lambda callback: restorations.append(callback)
+        a.attempt_session_release_async = lambda callback: callback(True)
+        return a, bus, acquisition_results, restorations
+
+    def test_off_defers_unknown_acquisition_disconnect_until_restore(self):
+        a, bus, acquisition_results, restorations = \
+            self.prepare_unknown_acquisition_with_brightness_restore()
+        results = []
+        a.release_async(results.append)
+        self.assertEqual(len(acquisition_results), 1)
+        self.assertEqual(len(restorations), 1)
+        bus.close.assert_not_called()
+        self.assertEqual(results, [])
+        restorations.pop()('restored')
+        bus.close.assert_called_once()
+        self.assertEqual(results, [False])
+
+    def test_stop_defers_unknown_acquisition_disconnect_until_restore(self):
+        a, bus, acquisition_results, restorations = \
+            self.prepare_unknown_acquisition_with_brightness_restore()
+        a.stop()
+        self.assertEqual(len(acquisition_results), 1)
+        self.assertEqual(len(restorations), 1)
+        bus.close.assert_not_called()
+        restorations.pop()('restored')
+        bus.close.assert_called_once()
+        a.loop.quit.assert_called()
+
+    def test_async_known_cookie_owner_mismatch_releases_without_disconnect(self):
+        a = self.agent
+        a.desired = True
+        results = []
+        session_lookups = 0
+        def lookup(name, **kwargs):
+            nonlocal session_lookups
+            if name == agent_module.SESSION:
+                session_lookups += 1
+                owner = ':1.gnome' if session_lookups == 1 else ':1.other'
+            else:
+                owner = ':1.login' if name == agent_module.LOGIN else ':1.gnome'
+            kwargs['reply_handler'](owner)
+        names = types.SimpleNamespace(GetNameOwner=mock.Mock(side_effect=lookup))
+        login = types.SimpleNamespace(Inhibit=mock.Mock(side_effect=lambda *_args, **kwargs:
+            kwargs['reply_handler'](types.SimpleNamespace(take=lambda: 42))))
+        gnome = types.SimpleNamespace(
+            Inhibit=mock.Mock(side_effect=lambda *_args, **kwargs:
+                kwargs['reply_handler'](agent_module.dbus.UInt32(7))),
+            Uninhibit=mock.Mock(side_effect=lambda *_args, **kwargs:
+                kwargs['reply_handler']()))
+        a.proxy = mock.Mock(side_effect=lambda _bus, name, _path, _interface:
+                            names if name == 'org.freedesktop.DBus' else
+                            login if name == ':1.login' else gnome)
+        a.session_bus = types.SimpleNamespace(get_is_connected=lambda: True, close=mock.Mock())
+        with mock.patch.object(agent_module.os, 'close') as close:
+            a.acquire_async(results.append)
+        close.assert_called_once_with(42)
+        gnome.Uninhibit.assert_called_once()
+        a.session_bus.close.assert_not_called()
+        self.assertEqual(len(results), 1)
+        self.assertIsInstance(results[0], FakeDBusException)
+        self.assertEqual(a.session_cookie_state, 'absent')
+        self.assertIsNone(a.session_cookie)
+
+    def test_async_known_cookie_failed_cleanup_stays_release_pending(self):
+        a = self.agent
+        a.desired = True
+        results = []
+        session_lookups = 0
+        def lookup(name, **kwargs):
+            nonlocal session_lookups
+            if name == agent_module.SESSION:
+                session_lookups += 1
+                owner = ':1.gnome' if session_lookups == 1 else ':1.other'
+            else:
+                owner = ':1.login' if name == agent_module.LOGIN else ':1.gnome'
+            kwargs['reply_handler'](owner)
+        names = types.SimpleNamespace(GetNameOwner=mock.Mock(side_effect=lookup))
+        login = types.SimpleNamespace(Inhibit=mock.Mock(side_effect=lambda *_args, **kwargs:
+            kwargs['reply_handler'](types.SimpleNamespace(take=lambda: 42))))
+        gnome = types.SimpleNamespace(
+            Inhibit=mock.Mock(side_effect=lambda *_args, **kwargs:
+                kwargs['reply_handler'](agent_module.dbus.UInt32(7))),
+            Uninhibit=mock.Mock(side_effect=lambda *_args, **kwargs:
+                kwargs['error_handler'](FakeDBusException('release failed'))))
+        a.proxy = mock.Mock(side_effect=lambda _bus, name, _path, _interface:
+                            names if name == 'org.freedesktop.DBus' else
+                            login if name == ':1.login' else gnome)
+        a.session_bus = types.SimpleNamespace(get_is_connected=lambda: True, close=mock.Mock())
+        with mock.patch.object(agent_module.os, 'close') as close:
+            a.acquire_async(results.append)
+        close.assert_called_once_with(42)
+        gnome.Uninhibit.assert_called_once()
+        a.session_bus.close.assert_not_called()
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0].get_dbus_name(), agent_module.IFACE + '.ReleasePending')
+        self.assertEqual(a.session_cookie, 7)
+        self.assertEqual(a.session_cookie_state, 'release-pending')
+        self.assertEqual(a.session_cookie_owner, ':1.gnome')
+
+    def test_stop_after_cookie_before_owner_validation_releases_known_cookie(self):
+        a = self.agent
+        a.desired = True
+        results, held_owner_replies = [], []
+        session_lookups = 0
+        def lookup(name, **kwargs):
+            nonlocal session_lookups
+            if name == agent_module.SESSION:
+                session_lookups += 1
+                if session_lookups == 2:
+                    held_owner_replies.append(kwargs['reply_handler'])
+                    return
+                owner = ':1.gnome'
+            else:
+                owner = ':1.login' if name == agent_module.LOGIN else ':1.gnome'
+            kwargs['reply_handler'](owner)
+        names = types.SimpleNamespace(GetNameOwner=mock.Mock(side_effect=lookup))
+        login = types.SimpleNamespace(Inhibit=mock.Mock(side_effect=lambda *_args, **kwargs:
+            kwargs['reply_handler'](types.SimpleNamespace(take=lambda: 42))))
+        gnome = types.SimpleNamespace(
+            Inhibit=mock.Mock(side_effect=lambda *_args, **kwargs:
+                kwargs['reply_handler'](agent_module.dbus.UInt32(7))),
+            Uninhibit=mock.Mock(side_effect=lambda *_args, **kwargs:
+                kwargs['reply_handler']()))
+        a.proxy = mock.Mock(side_effect=lambda _bus, name, _path, _interface:
+                            names if name == 'org.freedesktop.DBus' else
+                            login if name == ':1.login' else gnome)
+        a.session_bus = types.SimpleNamespace(get_is_connected=lambda: True, close=mock.Mock())
+        with mock.patch.object(agent_module.os, 'close') as close:
+            a.acquire_async(results.append)
+            self.assertEqual(len(held_owner_replies), 1)
+            a.stop()
+            held_owner_replies.pop()(':1.gnome')
+        close.assert_called_once_with(42)
+        gnome.Uninhibit.assert_called_once()
+        a.session_bus.close.assert_not_called()
+        self.assertEqual(len(results), 1)
+        self.assertIsNone(a.session_cookie)
+        a.loop.quit.assert_called()
+
+    def test_stop_after_gnome_confirmation_before_login_validation_releases_cookie(self):
+        a = self.agent
+        a.desired = True
+        results, login_owner_replies = [], []
+        login_lookups = 0
+        def lookup(name, **kwargs):
+            nonlocal login_lookups
+            if name == agent_module.LOGIN:
+                login_lookups += 1
+                if login_lookups == 2:
+                    login_owner_replies.append(kwargs['reply_handler'])
+                    return
+                owner = ':1.login'
+            else:
+                owner = ':1.gnome'
+            kwargs['reply_handler'](owner)
+        names = types.SimpleNamespace(GetNameOwner=mock.Mock(side_effect=lookup))
+        login = types.SimpleNamespace(Inhibit=mock.Mock(side_effect=lambda *_args, **kwargs:
+            kwargs['reply_handler'](types.SimpleNamespace(take=lambda: 42))))
+        gnome = types.SimpleNamespace(
+            Inhibit=mock.Mock(side_effect=lambda *_args, **kwargs:
+                kwargs['reply_handler'](agent_module.dbus.UInt32(7))),
+            Uninhibit=mock.Mock(side_effect=lambda *_args, **kwargs:
+                kwargs['reply_handler']()))
+        a.proxy = mock.Mock(side_effect=lambda _bus, name, _path, _interface:
+            names if name == 'org.freedesktop.DBus' else
+            login if name == ':1.login' else gnome)
+        a.session_bus = types.SimpleNamespace(get_is_connected=lambda: True, close=mock.Mock())
+        with mock.patch.object(agent_module.os, 'close') as close:
+            a.acquire_async(results.append)
+            self.assertEqual(len(login_owner_replies), 1)
+            a.stop()
+            login_owner_replies.pop()(':1.login')
+        close.assert_called_once_with(42)
+        gnome.Uninhibit.assert_called_once()
+        a.session_bus.close.assert_not_called()
+        self.assertEqual(len(results), 1)
+        self.assertIsNone(a.session_cookie)
+        a.loop.quit.assert_called()
+
+    def test_async_malformed_cookie_closes_fd_and_connection_boundary(self):
+        a = self.agent
+        a.desired = True
+        results = []
+        names = types.SimpleNamespace(GetNameOwner=mock.Mock(side_effect=lambda name, **kwargs:
+            kwargs['reply_handler'](':1.gnome' if name == agent_module.SESSION else ':1.login')))
+        login = types.SimpleNamespace(Inhibit=mock.Mock(side_effect=lambda *_args, **kwargs:
+            kwargs['reply_handler'](types.SimpleNamespace(take=lambda: 42))))
+        gnome = types.SimpleNamespace(Inhibit=mock.Mock(side_effect=lambda *_args, **kwargs:
+            kwargs['reply_handler']('bad-cookie')))
+        a.proxy = mock.Mock(side_effect=lambda _bus, name, _path, _interface:
+                            names if name == 'org.freedesktop.DBus' else
+                            login if name == ':1.login' else gnome)
+        a.session_bus = types.SimpleNamespace(get_is_connected=lambda: True, close=mock.Mock())
+        with mock.patch.object(agent_module.os, 'close') as close:
+            a.acquire_async(results.append)
+        close.assert_called_once_with(42)
+        a.session_bus.close.assert_called_once()
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0].get_dbus_name(), agent_module.IFACE + '.Unavailable')
+        self.assertIsNone(a.session_cookie)
+        self.assertTrue(a.exit_failure)
+
+    def test_async_predispatch_owner_error_never_closes_session_boundary(self):
+        a = self.agent
+        a.desired = True
+        results = []
+        names = types.SimpleNamespace(GetNameOwner=mock.Mock(side_effect=lambda _name, **kwargs:
+            kwargs['error_handler'](FakeDBusException('owner unavailable'))))
+        a.proxy = mock.Mock(return_value=names)
+        a.session_bus = types.SimpleNamespace(get_is_connected=lambda: True, close=mock.Mock())
+        a.acquire_async(results.append)
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0].get_dbus_name(), agent_module.IFACE + '.Unavailable')
+        a.session_bus.close.assert_not_called()
+        self.assertIsNone(a.prevention_acquisition)
+        self.assertIsNone(a.session_cookie)
+
+    def test_async_dispatched_inhibit_error_closes_fd_and_session_boundary(self):
+        a = self.agent
+        a.desired = True
+        results = []
+        names = types.SimpleNamespace(GetNameOwner=mock.Mock(side_effect=lambda name, **kwargs:
+            kwargs['reply_handler'](':1.gnome' if name == agent_module.SESSION else ':1.login')))
+        login = types.SimpleNamespace(Inhibit=mock.Mock(side_effect=lambda *_args, **kwargs:
+            kwargs['reply_handler'](types.SimpleNamespace(take=lambda: 42))))
+        gnome = types.SimpleNamespace(Inhibit=mock.Mock(side_effect=lambda *_args, **kwargs:
+            kwargs['error_handler'](FakeDBusException('remote Inhibit failed'))))
+        a.proxy = mock.Mock(side_effect=lambda _bus, name, _path, _interface:
+                            names if name == 'org.freedesktop.DBus' else
+                            login if name == ':1.login' else gnome)
+        a.session_bus = types.SimpleNamespace(get_is_connected=lambda: True, close=mock.Mock())
+        with mock.patch.object(agent_module.os, 'close') as close:
+            a.acquire_async(results.append)
+        close.assert_called_once_with(42)
+        a.session_bus.close.assert_called_once()
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0].get_dbus_name(), agent_module.IFACE + '.Unavailable')
+        self.assertIsNone(a.session_cookie)
+
+    def test_malformed_cookie_reply_closes_login_fd_and_connection_boundary(self):
+        a = self.agent
+        a.desired = True
+        session = types.SimpleNamespace(Inhibit=mock.Mock(return_value='bad-cookie'))
+        login = types.SimpleNamespace(Inhibit=mock.Mock(return_value=types.SimpleNamespace(take=lambda: 42)))
+        names = types.SimpleNamespace(GetNameOwner=mock.Mock(return_value=':1.login'))
+        a.proxy = mock.Mock(side_effect=lambda _bus, name, _path, _interface:
+                            names if name == 'org.freedesktop.DBus' else
+                            login if name == ':1.login' else session)
+        a.session_bus = types.SimpleNamespace(close=mock.Mock(), get_is_connected=lambda: True)
+        with mock.patch.object(agent_module.os, 'close') as close:
+            with self.assertRaises(FakeDBusException):
+                a.acquire()
+        close.assert_called_once_with(42)
+        a.session_bus.close.assert_called_once()
+        self.assertTrue(a.exit_failure)
+
     def test_lid_diagnostic_clear_preserves_unrelated_errors(self):
         self.agent.lid_error = 'Lid lock unavailable: denied'
         self.agent.last_error = self.agent.lid_error
-        self.agent.SetLidMode(False)
+        self.agent.SetLidMode(False, reply=mock.Mock(), error=mock.Mock())
         self.assertEqual(self.agent.last_error, '')
         self.assertEqual(self.agent.lid_error, '')
         self.agent.last_error = 'Unrelated persistence failure'
         self.agent.set_lid_error('Lid lock unavailable: denied')
-        self.agent.SetLidMode(False)
+        self.agent.SetLidMode(False, reply=mock.Mock(), error=mock.Mock())
         self.assertEqual(self.agent.last_error, 'Unrelated persistence failure')
         self.assertEqual(self.agent.lid_error, '')
 
@@ -1675,7 +3254,7 @@ class AgentTests(unittest.TestCase):
         self.assertEqual(self.agent.brightness_state(), 'restore-pending')
         self.agent.enabled = True
         self.agent.brightness_record['phase'] = 'prepared'
-        self.assertEqual(self.agent.brightness_state(), 'redim-pending')
+        self.assertEqual(self.agent.brightness_state(), 'restore-pending')
         for journal_state in ('invalid', 'unreadable'):
             self.agent.brightness_journal_state = journal_state
             self.assertEqual(self.agent.brightness_state(), journal_state)
@@ -1716,15 +3295,383 @@ class AgentTests(unittest.TestCase):
                 observed = []
                 def uninhibit(_cookie, **_kwargs):
                     observed.append(self.agent.brightness_record)
-                    if mode == 'no-adapter':
+                    if mode in ('no-adapter', 'prepared'):
                         self.assertIsNotNone(self.agent.brightness_record)
                     else:
                         self.assertIsNone(self.agent.brightness_record)
                         self.assertEqual(self.agent.brightness_adapter.value, 35 if mode == 'manual' else 70)
-                self.agent.proxy = mock.Mock(return_value=types.SimpleNamespace(Uninhibit=uninhibit))
+                    _kwargs['reply_handler']()
+                names = types.SimpleNamespace(GetNameOwner=lambda _name, **kwargs:
+                    kwargs['reply_handler'](':1.gnome'))
+                self.agent.proxy = mock.Mock(side_effect=lambda _bus, name, *_args:
+                    names if name == 'org.freedesktop.DBus' else
+                    types.SimpleNamespace(Uninhibit=uninhibit))
+                self.agent.session_bus = types.SimpleNamespace(get_is_connected=lambda: True)
                 self.agent.stop()
                 self.assertEqual(len(observed), 1)
                 self.agent.stop()
+
+    def test_stop_waits_for_async_restore_readback_before_release(self):
+        a = self.agent
+        a.enabled = a.lid_dimming = a.lid_closed = True
+        a.dim_brightness()
+        callbacks, events = [], []
+        adapter = a.brightness_adapter
+        adapter.read_async = lambda callback, **_kwargs: callbacks.append(callback)
+        adapter.write_async = lambda value, callback, **_kwargs: (
+            events.append(('write', value)), adapter.write(value), callback(None))
+        a.release_async = lambda callback, **_kwargs: (
+            events.append(('release', adapter.value)), callback(True))
+        a.stop()
+        self.assertEqual(events, [])
+        self.assertEqual(len(callbacks), 1)
+        callbacks.pop(0)(0, None)
+        self.assertEqual(events, [('write', 70)])
+        self.assertEqual(len(callbacks), 1)
+        callbacks.pop(0)(70, None)
+        self.assertEqual(events, [('write', 70), ('release', 70)])
+        self.assertIsNone(a.brightness_record)
+        a.loop.quit.assert_called_once()
+
+    def test_prevention_off_waits_for_brightness_readback_before_uninhibit(self):
+        a = self.agent
+        a.enabled = a.lid_dimming = a.lid_closed = True
+        a.dim_brightness()
+        callbacks, events, results = [], [], []
+        adapter = a.brightness_adapter
+        adapter.read_async = lambda callback, **_kwargs: callbacks.append(callback)
+        adapter.write_async = lambda value, callback, **_kwargs: (
+            events.append(('write', value)), adapter.write(value), callback(None))
+        a.session_bus = types.SimpleNamespace(get_is_connected=lambda: True)
+        a.attempt_session_release_async = lambda callback: (
+            events.append(('release', adapter.value)), callback(True))
+        a.release_async(results.append)
+        self.assertEqual(events, [])
+        self.assertEqual(results, [])
+        self.assertTrue(a.brightness_release_pending)
+        callbacks.pop(0)(0, None)
+        self.assertEqual(events, [('write', 70)])
+        self.assertEqual(results, [])
+        callbacks.pop(0)(70, None)
+        self.assertEqual(events, [('write', 70), ('release', 70)])
+        self.assertEqual(results, [True])
+        self.assertIsNone(a.brightness_record)
+        self.assertFalse(a.brightness_release_pending)
+
+    def test_remote_dimming_enable_journals_before_async_write_and_readback(self):
+        a = self.agent
+        a.enabled = a.lid_closed = True
+        adapter = a.brightness_adapter
+        reads, writes, replies, errors = [], [], [], []
+        adapter.read_async = lambda callback, **_kwargs: reads.append(callback)
+        adapter.write_async = lambda value, callback, **_kwargs: writes.append((value, callback))
+        a.SetLidDimming(True, reply=lambda: replies.append(True), error=errors.append)
+        self.assertEqual((len(reads), writes, replies, errors), (1, [], [], []))
+        reads.pop()(70, None)
+        self.assertEqual(len(writes), 1)
+        self.assertEqual(writes[0][0], 0)
+        self.assertEqual(json.loads(a.brightness_path.read_text())['phase'], 'prepared')
+        adapter.value = 0
+        writes.pop()[1](None)
+        self.assertEqual(json.loads(a.brightness_path.read_text())['phase'], 'set-confirmed')
+        reads.pop()(0, None)
+        self.assertEqual(json.loads(a.brightness_path.read_text())['phase'], 'applied')
+        self.assertEqual((replies, errors), ([True], []))
+
+    def test_async_dim_loads_existing_journal_without_starting_new_write(self):
+        a = self.agent
+        a.enabled = a.lid_dimming = a.lid_closed = True
+        record = {'schema': 3, 'identity': a.brightness_adapter.output_identity(),
+                  'machine': agent_module.machine_identity(), 'before': 70,
+                  'target': 0, 'phase': 'prepared'}
+        a.brightness_path.write_text(json.dumps(record))
+        a.brightness_record = None
+        a.brightness_adapter.read_async = mock.Mock(side_effect=AssertionError('unexpected read'))
+        results = []
+        a.dim_brightness_async(results.append)
+        self.assertEqual(results, ['pending'])
+        self.assertEqual(a.brightness_record, record)
+        a.brightness_adapter.read_async.assert_not_called()
+        self.assertEqual(a.brightness_adapter.writes, [])
+
+    def test_remote_dimming_disable_waits_for_inflight_dim_then_restores(self):
+        a = self.agent
+        a.enabled = a.lid_closed = True
+        adapter = a.brightness_adapter
+        reads, writes, on_replies, on_errors, off_replies, off_errors = [], [], [], [], [], []
+        adapter.read_async = lambda callback, **_kwargs: reads.append(callback)
+        adapter.write_async = lambda value, callback, **_kwargs: writes.append((value, callback))
+        a.SetLidDimming(True, reply=lambda: on_replies.append(True), error=on_errors.append)
+        reads.pop()(70, None)
+        a.SetLidDimming(False, reply=lambda: off_replies.append(True), error=off_errors.append)
+        self.assertEqual((on_replies, off_replies, len(writes)), ([], [], 1))
+        value, wrote = writes.pop()
+        adapter.value = value
+        wrote(None)
+        reads.pop()(0, None)
+        self.assertEqual(len(reads), 1)
+        reads.pop()(0, None)
+        value, restored = writes.pop()
+        self.assertEqual(value, 70)
+        adapter.value = value
+        restored(None)
+        reads.pop()(70, None)
+        self.assertEqual(on_replies, [])
+        self.assertEqual(len(on_errors), 1)
+        self.assertEqual((off_replies, off_errors), ([True], []))
+        self.assertIsNone(a.brightness_record)
+
+    def test_stop_waits_for_inflight_dim_and_retains_uncertain_write(self):
+        a = self.agent
+        a.enabled = a.lid_closed = True
+        reads, writes, releases, errors = [], [], [], []
+        a.brightness_adapter.read_async = lambda callback, **_kwargs: reads.append(callback)
+        a.brightness_adapter.write_async = lambda value, callback, **_kwargs: (
+            writes.append((value, callback)))
+        a.release_async = lambda callback, **_kwargs: (
+            releases.append(True), callback(True))
+        a.SetLidDimming(True, reply=lambda: None, error=errors.append)
+        reads.pop()(70, None)
+        record = json.loads(a.brightness_path.read_text())
+        a.stop()
+        self.assertEqual(releases, [])
+        writes[0][1](FakeDBusException('Set outcome unknown'))
+        self.assertEqual(releases, [True])
+        self.assertEqual(json.loads(a.brightness_path.read_text()), record)
+        self.assertEqual(record['phase'], 'prepared')
+        writes[0][1](None)
+        self.assertEqual(releases, [True])
+        self.assertEqual(len(errors), 1)
+        a.loop.quit.assert_called_once()
+
+    def test_remote_dim_timeout_retains_prepared_journal_and_ignores_late_set(self):
+        a = self.agent
+        a.enabled = a.lid_closed = True
+        reads, writes, replies, errors = [], [], [], []
+        a.brightness_adapter.read_async = lambda callback, **_kwargs: reads.append(callback)
+        a.brightness_adapter.write_async = lambda value, callback, **_kwargs: (
+            writes.append((value, callback)))
+        a.SetLidDimming(True, reply=lambda: replies.append(True), error=errors.append)
+        reads.pop()(70, None)
+        record = json.loads(a.brightness_path.read_text())
+        source = max(fake_glib.sources)
+        fake_glib.sources[source][1]()
+        self.assertEqual(replies, [])
+        self.assertEqual(len(errors), 1)
+        self.assertEqual(errors[0].get_dbus_name(), agent_module.IFACE + '.InvalidState')
+        self.assertEqual(record['phase'], 'prepared')
+        self.assertEqual(json.loads(a.brightness_path.read_text()), record)
+        writes[0][1](None)
+        self.assertEqual(json.loads(a.brightness_path.read_text()), record)
+        self.assertEqual(len(writes), 1)
+
+    def test_session_disconnect_invalidates_pending_dim_without_losing_journal(self):
+        a = self.agent
+        a.enabled = a.lid_closed = True
+        reads, writes = [], []
+        a.brightness_adapter.read_async = lambda callback, **_kwargs: reads.append(callback)
+        a.brightness_adapter.write_async = lambda value, callback, **_kwargs: (
+            writes.append((value, callback)))
+        a.SetLidDimming(True, reply=lambda: None, error=lambda _failure: None)
+        reads.pop()(70, None)
+        record = json.loads(a.brightness_path.read_text())
+        source = a.brightness_dim_operation['source']
+        a.on_session_bus_disconnected()
+        self.assertIsNone(a.brightness_dim_operation)
+        self.assertIn(source, fake_glib.removed)
+        writes.pop()[1](None)
+        self.assertEqual(json.loads(a.brightness_path.read_text()), record)
+        self.assertEqual(record['phase'], 'prepared')
+
+    def test_session_disconnect_invalidates_pending_restore_before_write(self):
+        a = self.agent
+        a.enabled = a.lid_dimming = a.lid_closed = True
+        a.dim_brightness()
+        record = json.loads(a.brightness_path.read_text())
+        reads = []
+        a.brightness_adapter.read_async = lambda callback, **_kwargs: reads.append(callback)
+        a.brightness_adapter.write_async = mock.Mock(side_effect=AssertionError('late write'))
+        a.restore_brightness_async(lambda _result: None)
+        source = a.brightness_restore_operation['source']
+        a.on_session_bus_disconnected()
+        self.assertIsNone(a.brightness_restore_operation)
+        self.assertIn(source, fake_glib.removed)
+        reads.pop()(0, None)
+        a.brightness_adapter.write_async.assert_not_called()
+        self.assertEqual(json.loads(a.brightness_path.read_text()), record)
+
+    def test_late_restore_read_keeps_journal_without_new_write(self):
+        a = self.agent
+        a.enabled = a.lid_dimming = a.lid_closed = True
+        a.dim_brightness()
+        record = json.loads(a.brightness_path.read_text())
+        reads, outcomes = [], []
+        a.brightness_adapter.read_async = lambda callback, **_kwargs: reads.append(callback)
+        a.brightness_adapter.write_async = mock.Mock()
+        clock = [100.0]
+        with mock.patch.object(agent_module.time, 'monotonic', side_effect=lambda: clock[0]):
+            a.restore_brightness_async(outcomes.append)
+            clock[0] = 110.0
+            reads.pop()(0, None)
+        self.assertEqual(outcomes, ['pending'])
+        self.assertEqual(json.loads(a.brightness_path.read_text()), record)
+        a.brightness_adapter.write_async.assert_not_called()
+
+    def test_late_restore_readback_keeps_recovery_journal(self):
+        a = self.agent
+        a.enabled = a.lid_dimming = a.lid_closed = True
+        a.dim_brightness()
+        record = json.loads(a.brightness_path.read_text())
+        reads, writes, outcomes = [], [], []
+        a.brightness_adapter.read_async = lambda callback, **_kwargs: reads.append(callback)
+        a.brightness_adapter.write_async = lambda value, callback, **_kwargs: (
+            writes.append((value, callback)))
+        clock = [100.0]
+        with mock.patch.object(agent_module.time, 'monotonic', side_effect=lambda: clock[0]):
+            a.restore_brightness_async(outcomes.append)
+            reads.pop()(0, None)
+            value, wrote = writes.pop()
+            self.assertEqual(value, record['before'])
+            wrote(None)
+            clock[0] = 110.0
+            reads.pop()(record['before'], None)
+        self.assertEqual(outcomes, ['pending'])
+        self.assertEqual(json.loads(a.brightness_path.read_text()), record)
+
+    def test_prevention_off_waits_for_inflight_async_dim_before_release(self):
+        a = self.agent
+        a.enabled = a.lid_closed = True
+        reads, writes, releases = [], [], []
+        adapter = a.brightness_adapter
+        adapter.read_async = lambda callback, **_kwargs: reads.append(callback)
+        adapter.write_async = lambda value, callback, **_kwargs: writes.append((value, callback))
+        a.SetLidDimming(True, reply=lambda: None, error=lambda _failure: None)
+        reads.pop()(70, None)
+        a.session_bus = types.SimpleNamespace(get_is_connected=lambda: True)
+        a.attempt_session_release_async = lambda callback: (
+            releases.append(adapter.value), callback(True))
+        results = []
+        a.release_async(results.append)
+        self.assertEqual(releases, [])
+        value, wrote = writes.pop()
+        adapter.value = value
+        wrote(None)
+        reads.pop()(0, None)
+        reads.pop()(0, None)
+        value, restored = writes.pop()
+        adapter.value = value
+        restored(None)
+        reads.pop()(70, None)
+        self.assertEqual((releases, results), ([70], [True]))
+        self.assertIsNone(a.brightness_record)
+
+    def test_prevention_off_retains_journal_after_uncertain_restore_write(self):
+        a = self.agent
+        a.enabled = a.lid_dimming = a.lid_closed = True
+        a.dim_brightness()
+        record = json.loads(a.brightness_path.read_text())
+        writes, releases, results = [], [], []
+        a.brightness_adapter.write_async = lambda value, callback, **_kwargs: (
+            writes.append((value, callback)))
+        a.session_bus = types.SimpleNamespace(get_is_connected=lambda: True)
+        a.attempt_session_release_async = lambda callback: (
+            releases.append(True), callback(True))
+        a.release_async(results.append)
+        self.assertEqual(len(writes), 1)
+        self.assertEqual(releases, [])
+        writes[0][1](FakeDBusException('restore Set timed out'))
+        self.assertEqual((releases, results), ([True], [True]))
+        self.assertEqual(json.loads(a.brightness_path.read_text()), record)
+        writes[0][1](None)
+        self.assertEqual((releases, results), ([True], [True]))
+        self.assertEqual(json.loads(a.brightness_path.read_text()), record)
+
+    def test_prevention_off_restore_deadline_setup_failure_releases_without_orphan(self):
+        a = self.agent
+        a.enabled = a.lid_dimming = a.lid_closed = True
+        a.dim_brightness()
+        record = json.loads(a.brightness_path.read_text())
+        releases, results = [], []
+        a.session_bus = types.SimpleNamespace(get_is_connected=lambda: True)
+        a.attempt_session_release_async = lambda callback: (
+            releases.append(True), callback(True))
+        with mock.patch.object(fake_glib, 'timeout_add', side_effect=OSError('source setup')), \
+                mock.patch.object(agent_module.LOG, 'exception'):
+            a.release_async(results.append)
+        self.assertEqual((releases, results), ([True], [True]))
+        self.assertIsNone(a.brightness_restore_operation)
+        self.assertEqual(json.loads(a.brightness_path.read_text()), record)
+
+    def test_stop_joins_prevention_off_restore_and_release(self):
+        a = self.agent
+        a.enabled = a.lid_dimming = a.lid_closed = True
+        a.dim_brightness()
+        reads, releases, off_results = [], [], []
+        adapter = a.brightness_adapter
+        adapter.read_async = lambda callback, **_kwargs: reads.append(callback)
+        a.session_bus = types.SimpleNamespace(get_is_connected=lambda: True)
+        a.attempt_session_release_async = lambda callback: (
+            releases.append(adapter.value), callback(True))
+        a.release_async(off_results.append)
+        a.stop()
+        self.assertEqual((len(reads), releases, off_results), (1, [], []))
+        reads.pop(0)(0, None)
+        self.assertEqual((len(reads), releases), (1, []))
+        reads.pop(0)(70, None)
+        self.assertEqual((releases, off_results), ([70], [True]))
+        a.loop.quit.assert_called_once()
+        self.assertIsNone(a.brightness_record)
+
+    def test_stop_joins_already_dispatched_prevention_release(self):
+        a = self.agent
+        replies, off_results = [], []
+        a.session_bus = types.SimpleNamespace(get_is_connected=lambda: True)
+        a.attempt_session_release_async = lambda callback: replies.append(callback)
+        a.release_async(off_results.append)
+        self.assertEqual(len(replies), 1)
+        a.stop()
+        self.assertEqual(len(replies), 1)
+        self.assertTrue(a.prevention_release['force_disconnect'])
+        replies.pop()(True)
+        self.assertEqual(off_results, [True])
+        a.loop.quit.assert_called_once()
+
+    def test_late_restore_read_reply_cannot_remove_uncertain_journal(self):
+        a = self.agent
+        a.enabled = a.lid_dimming = a.lid_closed = True
+        a.dim_brightness()
+        callbacks, outcomes = [], []
+        a.brightness_adapter.read_async = lambda callback, **_kwargs: callbacks.append(callback)
+        a.restore_brightness_async(outcomes.append)
+        record = json.loads(a.brightness_path.read_text())
+        pending_callback = callbacks.pop()
+        # A failed read settles the operation; an old success cannot write.
+        pending_callback(None, FakeDBusException('read timed out'))
+        pending_callback(0, None)
+        self.assertEqual(outcomes, ['pending'])
+        self.assertEqual(json.loads(a.brightness_path.read_text()), record)
+        self.assertEqual(a.brightness_adapter.writes, [0])
+
+    def test_stop_retains_journal_when_async_restore_write_is_uncertain(self):
+        a = self.agent
+        a.enabled = a.lid_dimming = a.lid_closed = True
+        a.dim_brightness()
+        record = json.loads(a.brightness_path.read_text())
+        writes, releases = [], []
+        a.brightness_adapter.write_async = lambda value, callback, **_kwargs: (
+            writes.append((value, callback)))
+        a.release_async = lambda callback, **_kwargs: (
+            releases.append(True), callback(True))
+        a.stop()
+        self.assertEqual(len(writes), 1)
+        self.assertEqual(releases, [])
+        writes[0][1](FakeDBusException('restore Set timed out'))
+        self.assertEqual(releases, [True])
+        self.assertEqual(json.loads(a.brightness_path.read_text()), record)
+        self.assertTrue(a.brightness_recovery_pending())
+        writes[0][1](None)
+        self.assertEqual(releases, [True])
+        self.assertEqual(json.loads(a.brightness_path.read_text()), record)
 
     def test_settings_and_journal_memory_match_each_directory_failure(self):
         # Caller-level fault matrix complements atomic_json's visibility test.
@@ -1767,6 +3714,7 @@ class AgentTests(unittest.TestCase):
     def test_shutdown_remote_faults_retain_evidence_and_close_local_fds(self):
         for stage in ('read', 'write', 'readback', 'owner', 'uninhibit'):
             with self.subTest(stage=stage):
+                fake_glib.sources.clear()
                 a = self.agent
                 a.shutting_down = False
                 a.exit_failure = False
@@ -1781,21 +3729,45 @@ class AgentTests(unittest.TestCase):
                 a.session_cookie_state = 'held'
                 a.session_cookie_owner = ':1.gnome'
                 a.fd, a.lid_fd = 99, 100
-                a.session_manager_owner = mock.Mock(return_value=':1.gnome')
-                remote = types.SimpleNamespace(Uninhibit=mock.Mock())
-                a.proxy = mock.Mock(return_value=remote)
-                a.session_bus = types.SimpleNamespace(close=mock.Mock())
+                names, remote = mock.Mock(), mock.Mock()
+                a.proxy = mock.Mock(side_effect=lambda _bus, owner, _path, _interface:
+                                    names if owner == 'org.freedesktop.DBus' else remote)
+                a.session_bus = types.SimpleNamespace(close=mock.Mock(),
+                                                       get_is_connected=lambda: True)
                 failure = FakeDBusException('timeout')
                 with __import__('contextlib').ExitStack() as stack:
-                    if stage in ('read', 'readback'):
-                        values = [failure, failure] if stage == 'read' else [0, failure, failure]
-                        stack.enter_context(mock.patch.object(a.brightness_adapter, 'read', side_effect=values))
+                    if stage == 'read':
+                        stack.enter_context(mock.patch.object(
+                            a.brightness_adapter, 'read_async',
+                            side_effect=lambda callback, **_kwargs: callback(None, failure)))
+                    elif stage == 'readback':
+                        reads = 0
+                        original_read = a.brightness_adapter.read_async
+                        def read_with_failure(callback, **kwargs):
+                            nonlocal reads
+                            reads += 1
+                            if reads == 2:
+                                callback(None, failure)
+                            else:
+                                original_read(callback, **kwargs)
+                        stack.enter_context(mock.patch.object(
+                            a.brightness_adapter, 'read_async', side_effect=read_with_failure))
                     elif stage == 'write':
-                        stack.enter_context(mock.patch.object(a.brightness_adapter, 'write', side_effect=failure))
+                        stack.enter_context(mock.patch.object(
+                            a.brightness_adapter, 'write_async',
+                            side_effect=lambda _value, callback, **_kwargs: callback(failure)))
                     elif stage == 'owner':
-                        a.session_manager_owner.side_effect = failure
+                        names.GetNameOwner.side_effect = lambda _name, **kwargs: \
+                            kwargs['error_handler'](failure)
                     else:
-                        remote.Uninhibit.side_effect = failure
+                        remote.Uninhibit.side_effect = lambda _cookie, **kwargs: \
+                            kwargs['error_handler'](failure)
+                    if stage != 'owner':
+                        names.GetNameOwner.side_effect = lambda _name, **kwargs: \
+                            kwargs['reply_handler'](':1.gnome')
+                    if stage != 'uninhibit':
+                        remote.Uninhibit.side_effect = lambda _cookie, **kwargs: \
+                            kwargs['reply_handler']()
                     close = stack.enter_context(mock.patch.object(agent_module.os, 'close'))
                     a.stop()
                 self.assertIn(mock.call(99), close.call_args_list)
@@ -1809,6 +3781,25 @@ class AgentTests(unittest.TestCase):
                     self.assertEqual(a.brightness_adapter.value, 70)
                     a.session_bus.close.assert_called_once()
                 self.assertFalse(fake_glib.sources)
+
+    def test_stop_deadline_closes_connection_and_local_fds_after_stalled_restore(self):
+        a = self.agent
+        a.session_bus = types.SimpleNamespace(close=mock.Mock(),
+                                              get_is_connected=lambda: True)
+        a.fd, a.lid_fd = 99, 100
+        a.restore_brightness_async = mock.Mock()
+        with mock.patch.object(agent_module.os, 'close') as close:
+            a.stop()
+            source = a.stop_deadline_source
+            self.assertIn(source, fake_glib.sources)
+            fake_glib.sources[source][1]()
+        self.assertTrue(a.exit_failure)
+        self.assertIsNone(a.fd)
+        self.assertIsNone(a.lid_fd)
+        self.assertIn(mock.call(99), close.call_args_list)
+        self.assertIn(mock.call(100), close.call_args_list)
+        a.session_bus.close.assert_called_once()
+        a.loop.quit.assert_called()
 
     def test_precommit_failures_preserve_settings_and_prepared_recovery_record(self):
         from contextlib import ExitStack
@@ -1882,6 +3873,100 @@ class AgentTests(unittest.TestCase):
         self.assertEqual(state['sleepPhase'], 'uncertain-blocked')
         self.assertEqual(state['sleepOutcome'], 'logind-state-unreadable')
         self.assertEqual(state['suspendRequestOutcome'], 'unknown')
+
+    def test_async_timer_dispatches_once_after_release_and_final_preflight(self):
+        self.agent.deadline = 10
+        self.agent.timer_phase = 'running'
+        self.agent.require_lid = True
+        self.agent.lid_closed = True
+        self.agent.enabled = self.agent.desired = True
+        preflights = []
+
+        def preflight(callback, **kwargs):
+            preflights.append(kwargs)
+            callback(True, '', ':1.login')
+
+        def release(callback, **_kwargs):
+            self.agent.enabled = False
+            self.agent.session_cookie = None
+            self.agent.session_cookie_state = 'absent'
+            callback(True)
+
+        login = types.SimpleNamespace(Suspend=mock.Mock())
+        self.agent.suspend_preflight_async = mock.Mock(side_effect=preflight)
+        self.agent.release_async = mock.Mock(side_effect=release)
+        self.agent.proxy = mock.Mock(return_value=login)
+        self.assertTrue(self.agent.sleep_now('Countdown elapsed'))
+        login.Suspend.assert_called_once()
+        self.assertEqual(login.Suspend.call_args.args, (False,))
+        self.assertEqual([item['require_cookie_absent'] for item in preflights],
+                         [False, True])
+        self.assertIsNone(self.agent.deadline)
+        self.assertEqual(self.agent.timer_phase, 'consumed')
+        login.Suspend.call_args.kwargs['reply_handler']()
+        self.assertEqual(self.agent.suspend_request_outcome, 'accepted')
+        self.assertEqual(self.agent.sleep_tx['phase'], 'request-pending')
+
+    def test_async_timer_lid_change_after_release_blocks_suspend(self):
+        self.agent.deadline = 10
+        self.agent.timer_phase = 'running'
+        self.agent.require_lid = True
+        self.agent.lid_closed = True
+        self.agent.suspend_preflight_async = mock.Mock(
+            side_effect=lambda callback, **_kwargs: callback(True, '', ':1.login'))
+
+        def release(callback, **_kwargs):
+            self.agent.lid_closed = False
+            callback(True)
+
+        login = types.SimpleNamespace(Suspend=mock.Mock())
+        self.agent.release_async = mock.Mock(side_effect=release)
+        self.agent.proxy = mock.Mock(return_value=login)
+        self.assertTrue(self.agent.sleep_now('Countdown elapsed'))
+        login.Suspend.assert_not_called()
+        self.assertEqual(self.agent.suspend_preflight_async.call_count, 1)
+        self.assertEqual(self.agent.timer_phase, 'consumed')
+        self.assertIn('confirmed closed lid', self.agent.timer_outcome)
+
+    def test_async_unknown_suspend_reply_does_not_dispatch_twice(self):
+        self.agent.deadline = 10
+        self.agent.timer_phase = 'running'
+        self.agent.suspend_preflight_async = mock.Mock(
+            side_effect=lambda callback, **_kwargs: callback(True, '', ':1.login'))
+        self.agent.release_async = mock.Mock(side_effect=lambda callback, **_kwargs: callback(True))
+        login = types.SimpleNamespace(Suspend=mock.Mock(side_effect=FakeDBusException(
+            'reply lost', name='org.freedesktop.DBus.Error.NoReply')))
+        self.agent.proxy = mock.Mock(return_value=login)
+        self.assertTrue(self.agent.sleep_now('Countdown elapsed'))
+        self.assertEqual(self.agent.suspend_request_outcome, 'unknown')
+        self.assertEqual(self.agent.sleep_tx['request_reply'], 'unknown')
+        self.assertFalse(self.agent.sleep_now('Countdown elapsed'))
+        login.Suspend.assert_called_once()
+
+    def test_async_preflight_requires_noninteractive_login_capability(self):
+        for capability in ('yes', 'challenge'):
+            with self.subTest(capability=capability):
+                names = types.SimpleNamespace(GetNameOwner=mock.Mock(
+                    side_effect=lambda _name, **kwargs: kwargs['reply_handler'](':1.login')))
+                properties = types.SimpleNamespace(Get=mock.Mock(
+                    side_effect=lambda _iface, _key, **kwargs: kwargs['reply_handler'](False)))
+                login = types.SimpleNamespace(CanSuspend=mock.Mock(
+                    side_effect=lambda **kwargs: kwargs['reply_handler'](capability)))
+                interfaces = {'org.freedesktop.DBus': names,
+                              'org.freedesktop.DBus.Properties': properties,
+                              'org.freedesktop.login1.Manager': login}
+                self.agent.proxy = mock.Mock(
+                    side_effect=lambda _bus, _owner, _path, interface: interfaces[interface])
+                outcomes = []
+                self.agent.suspend_preflight_async(
+                    lambda allowed, reason, owner: outcomes.append((allowed, reason, owner)),
+                    require_cookie_absent=True)
+                self.assertEqual(len(outcomes), 1)
+                self.assertEqual(outcomes[0][0], capability == 'yes')
+                self.assertEqual(outcomes[0][2], ':1.login' if capability == 'yes' else '')
+                self.assertEqual(names.GetNameOwner.call_count, 3 if capability == 'yes' else 2)
+                properties.Get.assert_called_once()
+                login.CanSuspend.assert_called_once()
 
 
 if __name__ == '__main__':

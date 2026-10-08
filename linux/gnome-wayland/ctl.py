@@ -11,6 +11,8 @@ import dbus
 APP = "org.sleepdisabler.App"
 PATH = "/org/sleepdisabler/App"
 IFACE = "org.sleepdisabler.App1"
+STATE_TIMEOUT_SECONDS = 3
+ACTION_TIMEOUT_SECONDS = 25
 
 
 def native(value):
@@ -47,35 +49,36 @@ def main():
     app = None
     try:
         bus = dbus.SessionBus()
-        app = dbus.Interface(bus.get_object(APP, PATH), IFACE)
-        state = app.GetState()
+        app = dbus.Interface(bus.get_object(APP, PATH, introspect=False), IFACE)
+        state = app.GetState(timeout=STATE_TIMEOUT_SECONDS)
         if args.command == "status":
             print(json.dumps(native(state), indent=2, sort_keys=True))
         elif args.command in ("on", "off"):
-            app.SetPrevention(args.command == "on")
+            app.SetPrevention(args.command == "on", timeout=ACTION_TIMEOUT_SECONDS)
         elif args.command == "lid":
-            app.SetLidMode(args.value == "on")
+            app.SetLidMode(args.value == "on", timeout=ACTION_TIMEOUT_SECONDS)
         elif args.command == "dim":
-            app.SetLidDimming(args.value == "on")
+            app.SetLidDimming(args.value == "on", timeout=ACTION_TIMEOUT_SECONDS)
         elif args.command == "failsafe":
             threshold = args.threshold if args.threshold is not None else state.get("threshold")
             if (not isinstance(threshold, int) or isinstance(threshold, (bool, dbus.Boolean))
                     or not 1 <= threshold <= 99):
                 parser.error("agent threshold must be an integer in 1–99")
-            app.SetFailsafe(args.value == "on", dbus.UInt32(threshold))
+            app.SetFailsafe(args.value == "on", dbus.UInt32(threshold), timeout=ACTION_TIMEOUT_SECONDS)
         elif args.command == "timer":
             if not 1 <= args.minutes <= 365 * 1440 + 23 * 60 + 59:
                 parser.error("minutes must be 1–527039")
-            app.StartTimer(dbus.UInt64(args.minutes * 60), args.lid_closed, args.prevention_on)
+            app.StartTimer(dbus.UInt64(args.minutes * 60), args.lid_closed, args.prevention_on,
+                           timeout=ACTION_TIMEOUT_SECONDS)
         elif args.command == "cancel-timer":
-            app.CancelTimer()
+            app.CancelTimer(timeout=ACTION_TIMEOUT_SECONDS)
         if args.command != "status":
-            print(json.dumps(native(app.GetState()), indent=2, sort_keys=True))
+            print(json.dumps(native(app.GetState(timeout=STATE_TIMEOUT_SECONDS)), indent=2, sort_keys=True))
     except dbus.DBusException as error:
         print(f"Sleep Disabler: {error}", file=sys.stderr)
         if app is not None:
             try:
-                print(json.dumps(native(app.GetState()), indent=2, sort_keys=True))
+                print(json.dumps(native(app.GetState(timeout=STATE_TIMEOUT_SECONDS)), indent=2, sort_keys=True))
             except dbus.DBusException:
                 pass
         return 1
