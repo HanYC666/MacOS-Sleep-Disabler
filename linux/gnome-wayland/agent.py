@@ -3148,7 +3148,9 @@ class Agent(dbus.service.Object):
                     False, timeout=RECOVERY_CALL_TIMEOUT,
                     reply_handler=lambda: self.finish_suspend_request(transaction, origin),
                     error_handler=lambda error: self.finish_suspend_request(transaction, origin, error))
-            except (dbus.DBusException, OSError) as failure:
+            except Exception as failure:
+                # A transport or marshalling failure can arrive after the
+                # request was handed to D-Bus. Keep its outcome unknown.
                 self.finish_suspend_request(transaction, origin, failure)
 
         def final_preflight(allowed, why, login_owner):
@@ -3245,17 +3247,21 @@ class Agent(dbus.service.Object):
             self.publish()
 
     def notify(self, summary, body):
-        if self.shutting_down or not self.session_bus.get_is_connected():
+        if self.shutting_down:
             return
         try:
+            if not self.session_bus.get_is_connected():
+                return
             self.proxy(self.session_bus, "org.freedesktop.Notifications",
                 "/org/freedesktop/Notifications", "org.freedesktop.Notifications").Notify(
                 "Sleep Disabler", dbus.UInt32(0), "", summary, body,
                 dbus.Array([], signature="s"), dbus.Dictionary({}, signature="sv"), dbus.Int32(5000),
                 timeout=NOTIFICATION_CALL_TIMEOUT, reply_handler=lambda _id: None,
                 error_handler=lambda error: LOG.debug('Notification unavailable: %s', error))
-        except (dbus.DBusException, OSError):
-            pass
+        except Exception as error:
+            # Notifications are advisory; a local proxy/setup failure must
+            # never interrupt inhibitor cleanup or sleep-state reconciliation.
+            LOG.debug('Notification dispatch unavailable: %s', error)
 
     def cancel_timer(self, reason=""):
         if self.deadline is None:

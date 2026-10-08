@@ -743,7 +743,8 @@ class AgentTests(unittest.TestCase):
         a.sleep_outcome = 'none'
         a.suspend_request_outcome = 'none'
         a.system_bus = object()
-        a.session_bus = object()
+        a.session_bus = types.SimpleNamespace(get_is_connected=lambda: True,
+                                               close=mock.Mock())
         a.session_cookie = None
         a.session_cookie_state = 'absent'
         a.session_cookie_owner = ''
@@ -798,7 +799,6 @@ class AgentTests(unittest.TestCase):
         a.last_timer_require_lid = False
         a.last_timer_require_prevention = False
         a.session_manager_owner = mock.Mock(return_value=':1.gnome')
-        a.preparing_for_sleep = mock.Mock(return_value=False)
         a.publish = mock.Mock()
         a.notify = mock.Mock()
         a.refresh_power = mock.Mock()
@@ -825,6 +825,62 @@ class AgentTests(unittest.TestCase):
             'owner_generation': self.agent.logind_owner_generation,
         }
         self.agent.suspend_request_outcome = reply
+
+    def drive_preflight(self, preparing=False, login_owner=':1.login',
+                        session_owner=':1.gnome', capability='yes'):
+        """Complete only the fake read callbacks used by current async preflight."""
+        def proxy(bus, _owner, _path, interface):
+            if interface == 'org.freedesktop.DBus':
+                owner = login_owner if bus is self.agent.system_bus else session_owner
+                return types.SimpleNamespace(GetNameOwner=lambda _name, **kwargs:
+                    kwargs['reply_handler'](owner))
+            if interface == 'org.freedesktop.DBus.Properties':
+                return types.SimpleNamespace(Get=lambda _iface, _key, **kwargs:
+                    kwargs['reply_handler'](preparing))
+            if interface == 'org.freedesktop.login1.Manager':
+                return types.SimpleNamespace(CanSuspend=lambda **kwargs:
+                    kwargs['reply_handler'](capability))
+            raise AssertionError('Unexpected preflight interface: ' + interface)
+
+        self.agent.proxy = mock.Mock(side_effect=proxy)
+        outcomes = []
+        self.agent.suspend_preflight_async(lambda *result: outcomes.append(result))
+        self.assertEqual(len(outcomes), 1)
+        return outcomes[0]
+
+    def queue_reconcile_bus(self, preparing=False, login_owner=':1.login'):
+        """Install a fake logind read whose callbacks require explicit delivery."""
+        pending = []
+        def proxy(_bus, _owner, _path, interface):
+            if interface == 'org.freedesktop.DBus':
+                return types.SimpleNamespace(GetNameOwner=lambda _name, **kwargs:
+                    pending.append(lambda: kwargs['reply_handler'](login_owner)))
+            if interface == 'org.freedesktop.DBus.Properties':
+                return types.SimpleNamespace(Get=lambda _iface, _key, **kwargs:
+                    pending.append(lambda: kwargs['reply_handler'](preparing)))
+            raise AssertionError('Unexpected reconcile interface: ' + interface)
+
+        self.agent.proxy = mock.Mock(side_effect=proxy)
+        def drain():
+            while pending:
+                pending.pop(0)()
+        return self.agent.proxy, drain
+
+    def drive_reconcile(self, trigger, preparing=False, login_owner=':1.login'):
+        """Deliver a fake logind owner/property/final-owner read in order."""
+        proxy, drain = self.queue_reconcile_bus(preparing, login_owner)
+        self.agent.reconcile_sleep_state(trigger)
+        drain()
+        return proxy
+
+    def allow_async_sleep_steps(self):
+        """Drive only fake successful prerequisite callbacks for an attempt."""
+        self.agent.suspend_preflight_async = mock.Mock(side_effect=lambda callback, **_kwargs:
+            callback(True, '', ':1.login'))
+        self.agent.release_async = mock.Mock(side_effect=lambda callback, **_kwargs:
+            callback(True))
+        self.agent.refresh_power_async = mock.Mock(side_effect=lambda callback=None, **_kwargs:
+            callback(True) if callback is not None else None)
 
     # Brightness journal and desired-state coordinator
 
@@ -1112,44 +1168,64 @@ class AgentTests(unittest.TestCase):
         self.agent.session_cookie_owner = ':1.gnome'
         self.agent.enabled = True
 
+    def fake_release_proxy(self, uninhibit):
+        """Pin the issuing GNOME owner before delivering a fake release result."""
+        names = types.SimpleNamespace(GetNameOwner=mock.Mock(
+            side_effect=lambda _name, **kwargs: kwargs['reply_handler'](':1.gnome')))
+        gnome = types.SimpleNamespace(Uninhibit=mock.Mock(side_effect=uninhibit))
+        self.agent.proxy = mock.Mock(side_effect=lambda _bus, owner, _path, _interface:
+                                     names if owner == 'org.freedesktop.DBus' else gnome)
+        return names, gnome
+
     def test_release_failure_schedules_exactly_one_five_second_source(self):
         self.held_cookie()
-        gnome = types.SimpleNamespace(
-            Uninhibit=mock.Mock(side_effect=FakeDBusException('timeout')))
-        self.agent.proxy = mock.Mock(return_value=gnome)
-        self.agent.reconcile_brightness = mock.Mock()
-        self.assertFalse(self.agent.release())
+        names, gnome = self.fake_release_proxy(lambda _cookie, **kwargs:
+            kwargs['error_handler'](FakeDBusException('timeout')))
+        outcomes = []
+        self.agent.release_async(outcomes.append, brightness_reconciled=True)
+        self.assertEqual(outcomes, [False])
         self.assertEqual(len(fake_glib.sources), 1)
         self.assertEqual(next(iter(fake_glib.sources.values()))[0], 5)
         self.agent.retry_session_release()
         self.assertEqual(len(fake_glib.sources), 1)
+        names.GetNameOwner.assert_called_once()
+        gnome.Uninhibit.assert_called_once()
 
     def test_release_retry_success_cancels_pending_state(self):
         self.held_cookie()
-        gnome = types.SimpleNamespace(
-            Uninhibit=mock.Mock(side_effect=[FakeDBusException('timeout'), None]))
-        self.agent.proxy = mock.Mock(return_value=gnome)
-        self.agent.reconcile_brightness = mock.Mock()
-        self.agent.release()
+        attempts = 0
+        def uninhibit(_cookie, **kwargs):
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                kwargs['error_handler'](FakeDBusException('timeout'))
+            else:
+                kwargs['reply_handler']()
+        names, gnome = self.fake_release_proxy(uninhibit)
+        outcomes = []
+        self.agent.release_async(outcomes.append, brightness_reconciled=True)
+        self.assertEqual(outcomes, [False])
         source = self.agent.release_retry_source
         callback = fake_glib.sources[source][1]
         callback()
         self.assertEqual(self.agent.session_cookie_state, 'absent')
         self.assertEqual(self.agent.release_retry_source, 0)
+        self.assertEqual(names.GetNameOwner.call_count, 2)
         self.assertEqual(gnome.Uninhibit.call_count, 2)
 
     def test_release_disconnects_after_three_total_attempts(self):
         self.held_cookie()
-        gnome = types.SimpleNamespace(
-            Uninhibit=mock.Mock(side_effect=FakeDBusException('timeout')))
-        bus = types.SimpleNamespace(close=mock.Mock())
+        names, gnome = self.fake_release_proxy(lambda _cookie, **kwargs:
+            kwargs['error_handler'](FakeDBusException('timeout')))
+        bus = types.SimpleNamespace(close=mock.Mock(), get_is_connected=lambda: True)
         self.agent.session_bus = bus
-        self.agent.proxy = mock.Mock(return_value=gnome)
-        self.agent.reconcile_brightness = mock.Mock()
-        self.agent.release()
+        outcomes = []
+        self.agent.release_async(outcomes.append, brightness_reconciled=True)
+        self.assertEqual(outcomes, [False])
         for _ in range(2):
             source = self.agent.release_retry_source
             fake_glib.sources[source][1]()
+        self.assertEqual(names.GetNameOwner.call_count, 3)
         self.assertEqual(gnome.Uninhibit.call_count, 3)
         bus.close.assert_called_once()
         self.assertTrue(self.agent.exit_failure)
@@ -1225,9 +1301,8 @@ class AgentTests(unittest.TestCase):
         self.begin_request()
         self.agent.sleep_tx['saw_prepare_true'] = True
         self.agent.sleep_tx['saw_prepare_false'] = True
-        self.agent.preparing_for_sleep.return_value = False
         with mock.patch.object(agent_module, 'boottime', return_value=20),                 mock.patch.object(agent_module.time, 'monotonic', return_value=10):
-            self.agent.reconcile_sleep_state('test')
+            self.drive_reconcile('test', preparing=False)
         self.assertEqual(self.agent.sleep_tx['phase'], 'idle')
         self.assertEqual(self.agent.sleep_outcome, 'proven-resume')
         self.assertEqual(self.agent.suspend_request_outcome, 'proven-suspend')
@@ -1236,19 +1311,20 @@ class AgentTests(unittest.TestCase):
     def test_accepted_request_without_signals_settles_without_stale_reason(self):
         self.begin_request()
         with mock.patch.object(agent_module, 'boottime', return_value=6),                 mock.patch.object(agent_module.time, 'monotonic', return_value=6):
-            self.agent.reconcile_sleep_state('test')
+            proxy = self.drive_reconcile('test', preparing=False)
         self.assertEqual(self.agent.sleep_tx['phase'], 'idle')
         self.assertEqual(self.agent.sleep_outcome, 'accepted-no-suspend')
         self.assertEqual(self.agent.suspend_request_outcome,
                          'accepted-without-observed-suspend')
         self.assertIn('accepted but no suspend observed', self.agent.timer_outcome)
         self.agent.notify.assert_called_once()
+        self.assertEqual(proxy.call_count, 3)
 
     def test_accepted_request_with_later_clock_gap_proves_suspend(self):
         self.begin_request(reply='accepted')
         with mock.patch.object(agent_module, 'boottime', return_value=20), \
                 mock.patch.object(agent_module.time, 'monotonic', return_value=10):
-            self.agent.reconcile_sleep_state('tick')
+            self.drive_reconcile('tick', preparing=False)
         self.assertEqual(self.agent.sleep_outcome, 'proven-resume')
         self.assertEqual(self.agent.suspend_request_outcome, 'proven-suspend')
 
@@ -1258,23 +1334,22 @@ class AgentTests(unittest.TestCase):
         self.agent.sleep_tx['phase'] = 'preparing'
         with mock.patch.object(agent_module, 'boottime', return_value=6), \
                 mock.patch.object(agent_module.time, 'monotonic', return_value=6):
-            self.agent.reconcile_sleep_state('tick')
+            proxy = self.drive_reconcile('tick', preparing=False)
         self.assertEqual(self.agent.sleep_outcome, 'failed-preparation')
         self.assertEqual(self.agent.suspend_request_outcome,
                          'accepted-without-observed-suspend')
         self.assertIn('accepted but no suspend observed', self.agent.timer_outcome)
         self.agent.notify.assert_called_once()
+        self.assertEqual(proxy.call_count, 3)
 
     def test_no_signals_then_clock_gap_is_proven_suspend(self):
         self.begin_request(reply='unknown')
-        self.agent.preparing_for_sleep.return_value = None
         with mock.patch.object(agent_module, 'boottime', return_value=20),                 mock.patch.object(agent_module.time, 'monotonic', return_value=10):
-            self.agent.reconcile_sleep_state('tick')
+            self.drive_reconcile('tick', preparing=None)
         self.assertEqual(self.agent.sleep_outcome, 'proven-resume')
         self.assertEqual(self.agent.sleep_tx['phase'], 'idle')
 
     def test_duplicate_true_preserves_original_baseline(self):
-        self.agent.preparing_for_sleep.return_value = True
         with mock.patch.object(agent_module, 'boottime', side_effect=[10, 15]),                 mock.patch.object(agent_module.time, 'monotonic', side_effect=[10, 10, 15, 15]):
             self.agent.observe_prepare_enter()
             baseline = self.agent.sleep_tx['gap_baseline']
@@ -1283,58 +1358,60 @@ class AgentTests(unittest.TestCase):
         self.assertTrue(self.agent.sleep_tx['saw_prepare_true'])
 
     def test_false_without_true_settles_conservatively_and_never_suspends(self):
-        self.agent.proxy = mock.Mock()
+        _proxy, drain = self.queue_reconcile_bus(preparing=False)
         with mock.patch.object(agent_module, 'boottime', return_value=0),                 mock.patch.object(agent_module.time, 'monotonic', return_value=0):
             self.agent.observe_prepare_exit()
+            drain()
         with mock.patch.object(agent_module, 'boottime', return_value=6),                 mock.patch.object(agent_module.time, 'monotonic', return_value=6):
-            self.agent.reconcile_sleep_state('tick')
+            proxy = self.drive_reconcile('tick', preparing=False)
         self.assertEqual(self.agent.sleep_outcome, 'uncertain-preparation')
-        self.agent.proxy.assert_not_called()
+        self.assertEqual(proxy.call_count, 3)
 
     def test_repeated_false_after_resolution_is_idempotent(self):
+        _proxy, drain = self.queue_reconcile_bus(preparing=False)
         with mock.patch.object(agent_module, 'boottime', return_value=0), \
                 mock.patch.object(agent_module.time, 'monotonic', return_value=0):
             self.agent.observe_prepare_exit()
+            drain()
         with mock.patch.object(agent_module, 'boottime', return_value=6), \
                 mock.patch.object(agent_module.time, 'monotonic', return_value=6):
-            self.agent.reconcile_sleep_state('tick')
+            self.drive_reconcile('tick', preparing=False)
             self.agent.observe_prepare_exit()
         self.assertEqual(self.agent.sleep_tx['phase'], 'idle')
         self.assertEqual(self.agent.sleep_outcome, 'uncertain-preparation')
 
     def test_false_then_delayed_true_converges_through_one_transaction(self):
-        self.agent.proxy = mock.Mock()
+        _proxy, drain = self.queue_reconcile_bus(preparing=False)
         with mock.patch.object(agent_module, 'boottime', return_value=0), \
                 mock.patch.object(agent_module.time, 'monotonic', return_value=0):
             self.agent.observe_prepare_exit()
+            drain()
         with mock.patch.object(agent_module, 'boottime', return_value=1), \
                 mock.patch.object(agent_module.time, 'monotonic', return_value=1):
             self.agent.observe_prepare_enter()
         with mock.patch.object(agent_module, 'boottime', return_value=6), \
                 mock.patch.object(agent_module.time, 'monotonic', return_value=6):
-            self.agent.reconcile_sleep_state('delayed-enter')
+            proxy = self.drive_reconcile('delayed-enter', preparing=False)
             self.agent.observe_prepare_exit()
         self.assertEqual(self.agent.sleep_tx['phase'], 'idle')
         self.assertEqual(self.agent.sleep_outcome, 'failed-preparation')
-        self.agent.proxy.assert_not_called()
+        self.assertEqual(proxy.call_count, 3)
 
     def test_true_beyond_deadline_keeps_safety_latch_and_cancels_real_timer(self):
         self.agent.deadline = 100
         self.agent.timer_phase = 'running'
-        self.agent.preparing_for_sleep.return_value = True
         with mock.patch.object(agent_module, 'boottime', return_value=0),                 mock.patch.object(agent_module.time, 'monotonic', return_value=0):
             self.agent.observe_prepare_enter()
         with mock.patch.object(agent_module, 'boottime', return_value=31),                 mock.patch.object(agent_module.time, 'monotonic', return_value=31):
-            self.agent.reconcile_sleep_state('tick')
+            self.drive_reconcile('tick', preparing=True)
         self.assertEqual(self.agent.sleep_tx['phase'], 'uncertain-blocked')
         self.assertIsNone(self.agent.deadline)
         self.assertEqual(self.agent.timer_phase, 'canceled')
 
     def test_uncertain_without_timer_does_not_invent_canceled_timer(self):
         self.begin_request()
-        self.agent.preparing_for_sleep.return_value = None
         with mock.patch.object(agent_module, 'boottime', return_value=31),                 mock.patch.object(agent_module.time, 'monotonic', return_value=31):
-            self.agent.reconcile_sleep_state('tick')
+            self.drive_reconcile('tick', preparing=None)
         self.assertEqual(self.agent.sleep_tx['phase'], 'uncertain-blocked')
         self.assertEqual(self.agent.timer_phase, 'idle')
 
@@ -1349,12 +1426,14 @@ class AgentTests(unittest.TestCase):
         self.agent.check_failsafe = agent_module.Agent.check_failsafe.__get__(self.agent)
         self.agent.check_failsafe()
         self.agent.sleep_now.assert_not_called()
-        self.assertFalse(self.agent.suspend_preflight()[0])
+        outcomes = []
+        self.agent.suspend_preflight_async(lambda *result: outcomes.append(result))
+        self.assertEqual(len(outcomes), 1)
+        self.assertFalse(outcomes[0][0])
 
     def test_uncertain_latch_blocks_periodic_and_upower_failsafe_paths(self):
         self.agent.sleep_tx['phase'] = 'uncertain-blocked'
         self.agent.sleep_tx['uncertain_since'] = 0
-        self.agent.preparing_for_sleep.return_value = None
         self.agent.enabled = True
         self.agent.failsafe = True
         self.agent.on_battery = True
@@ -1369,42 +1448,38 @@ class AgentTests(unittest.TestCase):
 
     def test_unreadable_property_retains_latch_until_clock_evidence(self):
         self.begin_request(reply='unknown')
-        self.agent.preparing_for_sleep.return_value = None
         with mock.patch.object(agent_module, 'boottime', return_value=10), \
                 mock.patch.object(agent_module.time, 'monotonic', return_value=10):
-            self.agent.reconcile_sleep_state('before-deadline')
+            self.drive_reconcile('before-deadline', preparing=None)
         self.assertEqual(self.agent.sleep_tx['phase'], 'request-pending')
         with mock.patch.object(agent_module, 'boottime', return_value=31), \
                 mock.patch.object(agent_module.time, 'monotonic', return_value=31):
-            self.agent.reconcile_sleep_state('after-deadline')
+            self.drive_reconcile('after-deadline', preparing=None)
         self.assertEqual(self.agent.sleep_tx['phase'], 'uncertain-blocked')
         with mock.patch.object(agent_module, 'boottime', return_value=50), \
                 mock.patch.object(agent_module.time, 'monotonic', return_value=40):
-            self.agent.reconcile_sleep_state('clock-evidence')
+            self.drive_reconcile('clock-evidence', preparing=None)
         self.assertEqual(self.agent.sleep_tx['phase'], 'idle')
         self.assertEqual(self.agent.sleep_outcome, 'proven-resume')
 
     def test_clock_gap_waits_while_logind_still_reports_preparing(self):
         self.begin_request(reply='unknown')
-        self.agent.preparing_for_sleep.return_value = True
         with mock.patch.object(agent_module, 'boottime', return_value=40), \
                 mock.patch.object(agent_module.time, 'monotonic', return_value=31):
-            self.agent.reconcile_sleep_state('clock-gap-while-preparing')
+            self.drive_reconcile('clock-gap-while-preparing', preparing=True)
         self.assertEqual(self.agent.sleep_tx['phase'], 'uncertain-blocked')
         self.assertEqual(self.agent.sleep_outcome, 'preparation-state-uncertain')
-        self.agent.preparing_for_sleep.return_value = False
         with mock.patch.object(agent_module, 'boottime', return_value=40), \
                 mock.patch.object(agent_module.time, 'monotonic', return_value=31):
-            self.agent.reconcile_sleep_state('preparation-cleared')
+            self.drive_reconcile('preparation-cleared', preparing=False)
         self.assertEqual(self.agent.sleep_tx['phase'], 'idle')
         self.assertEqual(self.agent.sleep_outcome, 'proven-resume')
 
     def test_later_false_resolves_unreadable_latch_after_settle(self):
         self.begin_request(reply='unknown')
         self.agent.sleep_tx['phase'] = 'uncertain-blocked'
-        self.agent.preparing_for_sleep.return_value = False
         with mock.patch.object(agent_module, 'boottime', return_value=40),                 mock.patch.object(agent_module.time, 'monotonic', return_value=40):
-            self.agent.reconcile_sleep_state('tick')
+            self.drive_reconcile('tick', preparing=False)
         self.assertEqual(self.agent.sleep_tx['phase'], 'idle')
         self.assertEqual(self.agent.sleep_outcome, 'request-outcome-unknown')
 
@@ -1419,38 +1494,37 @@ class AgentTests(unittest.TestCase):
     def test_generation_mismatch_is_resolved_before_reading_old_logind_state(self):
         self.begin_request(reply='unknown')
         self.agent.logind_owner_generation = 1
+        self.agent.proxy = mock.Mock()
         self.agent.reconcile_sleep_state('generation-check')
         self.assertEqual(self.agent.sleep_tx['phase'], 'idle')
         self.assertEqual(self.agent.sleep_outcome, 'logind-owner-lost')
-        self.agent.preparing_for_sleep.assert_not_called()
+        self.agent.proxy.assert_not_called()
 
     def test_logind_replacement_requires_fresh_readable_preflight(self):
         self.begin_request(reply='unknown')
         self.agent.on_owner_change(agent_module.LOGIN, ':1.old', ':1.new')
-        self.agent.preparing_for_sleep.return_value = None
-        self.assertFalse(self.agent.suspend_preflight()[0])
-        self.agent.preparing_for_sleep.return_value = False
-        self.assertTrue(self.agent.suspend_preflight()[0])
+        self.assertFalse(self.drive_preflight(preparing=None)[0])
+        self.assertTrue(self.drive_preflight(preparing=False)[0])
 
     def test_preflight_rejects_cookie_owner_mismatch_before_release(self):
         self.held_cookie()
-        self.agent.session_manager_owner.return_value = ':1.other'
-        allowed, message = self.agent.suspend_preflight()
+        allowed, message, _owner = self.drive_preflight(session_owner=':1.other')
         self.assertFalse(allowed)
         self.assertIn('previous', message)
 
     def test_state_change_between_release_and_final_guard_prevents_suspend(self):
         self.agent.deadline = 10
         self.agent.timer_phase = 'running'
-        def release():
+        self.allow_async_sleep_steps()
+        def release(callback, **_kwargs):
             self.agent.sleep_tx['phase'] = 'preparing'
             self.agent.session_cookie_state = 'absent'
             self.agent.session_cookie = None
-            return True
-        self.agent.release = mock.Mock(side_effect=release)
+            callback(True)
+        self.agent.release_async.side_effect = release
         login = types.SimpleNamespace(Suspend=mock.Mock())
         self.agent.proxy = mock.Mock(return_value=login)
-        self.assertFalse(self.agent.sleep_now('Countdown elapsed'))
+        self.assertTrue(self.agent.sleep_now('Countdown elapsed'))
         login.Suspend.assert_not_called()
         self.assertEqual(self.agent.timer_phase, 'consumed')
 
@@ -1460,7 +1534,7 @@ class AgentTests(unittest.TestCase):
                 self.agent.sleep_tx = self.agent.idle_sleep_transaction()
                 self.agent.deadline = 10
                 self.agent.timer_phase = 'running'
-                self.agent.release = mock.Mock(return_value=True)
+                self.allow_async_sleep_steps()
                 login = types.SimpleNamespace(
                     Suspend=mock.Mock(side_effect=FakeDBusException('denied', name=name)))
                 self.agent.proxy = mock.Mock(return_value=login)
@@ -1478,7 +1552,7 @@ class AgentTests(unittest.TestCase):
         for name in names:
             with self.subTest(name=name):
                 self.agent.sleep_tx = self.agent.idle_sleep_transaction()
-                self.agent.release = mock.Mock(return_value=True)
+                self.allow_async_sleep_steps()
                 login = types.SimpleNamespace(
                     Suspend=mock.Mock(side_effect=FakeDBusException('lost', name=name)))
                 self.agent.proxy = mock.Mock(return_value=login)
@@ -1488,8 +1562,9 @@ class AgentTests(unittest.TestCase):
                 self.agent.notify.assert_called_once()
                 with mock.patch.object(agent_module, 'boottime', return_value=10), \
                         mock.patch.object(agent_module.time, 'monotonic', return_value=10):
-                    self.agent.reconcile_sleep_state('tick')
+                    self.drive_reconcile('tick', preparing=False)
                 self.assertEqual(login.Suspend.call_count, 1)
+                self.assertEqual(self.agent.suspend_request_outcome, 'unknown')
                 self.agent.notify.reset_mock()
 
     def test_low_battery_episode_never_retries_ambiguous_suspend(self):
@@ -1498,7 +1573,7 @@ class AgentTests(unittest.TestCase):
         self.agent.on_battery = True
         self.agent.battery_discharge_state = 'discharging'
         self.agent.battery_percent = 5
-        self.agent.release = mock.Mock(return_value=True)
+        self.allow_async_sleep_steps()
         login = types.SimpleNamespace(Suspend=mock.Mock(side_effect=FakeDBusException(
             'lost', name='org.freedesktop.DBus.Error.NoReply')))
         self.agent.proxy = mock.Mock(return_value=login)
@@ -1507,7 +1582,8 @@ class AgentTests(unittest.TestCase):
         self.agent.check_failsafe()
         with mock.patch.object(agent_module, 'boottime', return_value=6), \
                 mock.patch.object(agent_module.time, 'monotonic', return_value=6):
-            self.agent.reconcile_sleep_state('settled')
+            self.drive_reconcile('settled', preparing=False)
+        self.agent.proxy = mock.Mock(return_value=login)
         self.agent.check_failsafe()
         self.assertEqual(login.Suspend.call_count, 1)
 
@@ -1550,7 +1626,7 @@ class AgentTests(unittest.TestCase):
         self.agent.sleep_tx['saw_prepare_false'] = True
         with mock.patch.object(agent_module, 'boottime', return_value=6), \
                 mock.patch.object(agent_module.time, 'monotonic', return_value=6):
-            self.agent.reconcile_sleep_state('settled')
+            self.drive_reconcile('settled', preparing=False)
         self.assertEqual(self.agent.sleep_tx['phase'], 'idle')
         self.assertEqual(self.agent.sleep_outcome, 'uncertain-preparation')
         self.assertEqual(self.agent.suspend_request_outcome, 'unknown')
@@ -1558,22 +1634,22 @@ class AgentTests(unittest.TestCase):
 
     def test_unknown_reply_with_unreadable_property_becomes_safety_blocked(self):
         self.begin_request(reply='unknown')
-        self.agent.preparing_for_sleep.return_value = None
         with mock.patch.object(agent_module, 'boottime', return_value=31), \
                 mock.patch.object(agent_module.time, 'monotonic', return_value=31):
-            self.agent.reconcile_sleep_state('deadline')
+            self.drive_reconcile('deadline', preparing=None)
         self.assertEqual(self.agent.sleep_tx['phase'], 'uncertain-blocked')
         self.assertEqual(self.agent.suspend_request_outcome, 'unknown')
 
     def test_timer_and_failsafe_defer_while_preparation_is_unresolved(self):
         self.agent.sleep_tx['phase'] = 'preparing'
         self.agent.sleep_tx['uncertain_since'] = 0
-        self.agent.preparing_for_sleep.return_value = True
         self.agent.sleep_now = mock.Mock()
+        proxy, drain = self.queue_reconcile_bus(preparing=True)
         with mock.patch.object(agent_module, 'boottime', return_value=0), \
                 mock.patch.object(agent_module.time, 'monotonic', return_value=0):
             self.agent.StartTimer(60, False, False, reply=mock.Mock(), error=mock.Mock())
             self.agent.tick()
+            drain()
         self.agent.enabled = True
         self.agent.failsafe = True
         self.agent.on_battery = True
@@ -1583,10 +1659,11 @@ class AgentTests(unittest.TestCase):
         self.agent.check_failsafe()
         self.agent.sleep_now.assert_not_called()
         self.assertEqual(self.agent.timer_phase, 'running')
+        self.assertEqual(proxy.call_count, 3)
 
     def test_reentrant_wake_resolution_is_not_resurrected_by_method_reply(self):
         self.configure_low_battery()
-        self.agent.release = mock.Mock(return_value=True)
+        self.allow_async_sleep_steps()
         def suspend(_interactive, **kwargs):
             self.agent.resolve_sleep_transaction('proven-resume', now=10, monotonic_now=0)
             kwargs['reply_handler']()
@@ -1599,7 +1676,7 @@ class AgentTests(unittest.TestCase):
 
     def test_reentrant_prepare_enter_is_not_overwritten_by_method_reply(self):
         self.configure_low_battery()
-        self.agent.release = mock.Mock(return_value=True)
+        self.allow_async_sleep_steps()
         login = types.SimpleNamespace(
             Suspend=mock.Mock(side_effect=lambda _interactive, **kwargs: (
                 self.agent.observe_prepare_enter(), kwargs['reply_handler']())))
@@ -1623,12 +1700,13 @@ class AgentTests(unittest.TestCase):
                 a.deadline, a.timer_phase = 0, 'running'
                 a.require_lid = a.require_prevention = True
                 a.lid_closed = a.enabled = a.desired = True
-                a.refresh_power.side_effect = lambda **_kwargs: setattr(a, 'lid_closed', lid)
-                a.release = mock.Mock(return_value=True)
+                self.allow_async_sleep_steps()
+                a.refresh_power_async.side_effect = lambda callback=None, **_kwargs: (
+                    setattr(a, 'lid_closed', lid), callback(True))
                 login = types.SimpleNamespace(Suspend=mock.Mock())
                 a.proxy = mock.Mock(return_value=login)
-                self.assertFalse(a.sleep_now('Countdown elapsed'))
-                a.release.assert_not_called()
+                self.assertTrue(a.sleep_now('Countdown elapsed'))
+                a.release_async.assert_not_called()
                 login.Suspend.assert_not_called()
                 self.assertTrue(a.enabled)
                 self.assertTrue(a.desired)
@@ -1645,26 +1723,24 @@ class AgentTests(unittest.TestCase):
                     a.require_lid = a.require_prevention = True
                     a.lid_closed = a.enabled = a.desired = True
                     a.sleep_tx = a.idle_sleep_transaction()
-                    a.refresh_power.reset_mock()
-                    a.preparing_for_sleep.reset_mock()
-                    def release():
+                    self.allow_async_sleep_steps()
+                    def release(callback, **_kwargs):
                         a.enabled = False
                         if moment == 'release':
                             a.lid_closed = lid
-                        return True
-                    def preparing():
-                        if moment == 'final-preflight' and a.preparing_for_sleep.call_count == 2:
+                        callback(True)
+                    def preflight(callback, **_kwargs):
+                        if moment == 'final-preflight' and a.suspend_preflight_async.call_count == 2:
                             a.lid_closed = lid
-                        return False
-                    a.release = mock.Mock(side_effect=release)
-                    a.preparing_for_sleep.side_effect = preparing
+                        callback(True, '', ':1.login')
+                    a.release_async.side_effect = release
+                    a.suspend_preflight_async.side_effect = preflight
                     login = types.SimpleNamespace(Suspend=mock.Mock())
                     a.proxy = mock.Mock(return_value=login)
-                    self.assertFalse(a.sleep_now('Countdown elapsed'))
-                    a.release.assert_called_once_with()
+                    self.assertTrue(a.sleep_now('Countdown elapsed'))
+                    a.release_async.assert_called_once()
                     login.Suspend.assert_not_called()
-                    self.assertEqual(a.refresh_power.call_args_list,
-                                     [mock.call(reconcile_lid=False), mock.call(reconcile_lid=False)])
+                    self.assertEqual(a.refresh_power_async.call_count, 2)
                     self.assertEqual(a.timer_phase, 'consumed')
                     self.assertFalse(a.desired)
                     self.assertFalse(a.enabled)
@@ -1675,12 +1751,13 @@ class AgentTests(unittest.TestCase):
         a.deadline, a.timer_phase = 0, 'running'
         a.require_prevention = True
         a.enabled = a.desired = True
-        a.preparing_for_sleep.side_effect = lambda: (setattr(a, 'enabled', False), False)[1]
-        a.release = mock.Mock(return_value=True)
+        self.allow_async_sleep_steps()
+        a.suspend_preflight_async.side_effect = lambda callback, **_kwargs: (
+            setattr(a, 'enabled', False), callback(True, '', ':1.login'))
         login = types.SimpleNamespace(Suspend=mock.Mock())
         a.proxy = mock.Mock(return_value=login)
-        self.assertFalse(a.sleep_now('Countdown elapsed'))
-        a.release.assert_not_called()
+        self.assertTrue(a.sleep_now('Countdown elapsed'))
+        a.release_async.assert_not_called()
         login.Suspend.assert_not_called()
         self.assertEqual(a.timer_phase, 'consumed')
         self.assertIn('effective prevention before release', a.timer_outcome)
@@ -1690,10 +1767,11 @@ class AgentTests(unittest.TestCase):
         a.deadline, a.timer_phase = 0, 'running'
         a.require_lid = a.require_prevention = True
         a.lid_closed = a.enabled = a.desired = True
-        def release():
+        self.allow_async_sleep_steps()
+        def release(callback, **_kwargs):
             a.enabled = False
-            return True
-        a.release = mock.Mock(side_effect=release)
+            callback(True)
+        a.release_async.side_effect = release
         login = types.SimpleNamespace(Suspend=mock.Mock())
         a.proxy = mock.Mock(return_value=login)
         self.assertTrue(a.sleep_now('Countdown elapsed'))
@@ -1706,8 +1784,7 @@ class AgentTests(unittest.TestCase):
         self.assertIsNone(a.deadline)
         self.assertEqual(a.timer_phase, 'consumed')
         self.assertFalse(a.enabled)
-        self.assertEqual(a.refresh_power.call_args_list,
-                         [mock.call(reconcile_lid=False), mock.call(reconcile_lid=False)])
+        self.assertEqual(a.refresh_power_async.call_count, 2)
 
     def test_preflight_reads_cannot_authorize_changed_lifecycle(self):
         for read in ('property', 'owner'):
@@ -1720,9 +1797,10 @@ class AgentTests(unittest.TestCase):
                     self.agent.session_cookie = 12
                     self.agent.session_cookie_state = 'held'
                     self.agent.session_cookie_owner = ':1.gnome'
-                    self.agent.preparing_for_sleep.side_effect = None
-                    self.agent.session_manager_owner.side_effect = None
-                    def altered_read():
+                    self.allow_async_sleep_steps()
+                    self.agent.suspend_preflight_async = mock.Mock(
+                        side_effect=agent_module.Agent.suspend_preflight_async.__get__(self.agent))
+                    def mutate():
                         if change == 'shutdown':
                             self.agent.shutting_down = True
                         elif change == 'transaction':
@@ -1731,14 +1809,27 @@ class AgentTests(unittest.TestCase):
                             self.agent.logind_owner_generation += 1
                         else:
                             self.agent.session_cookie_state = 'release-pending'
-                        return False if read == 'property' else ':1.gnome'
-                    callback = self.agent.preparing_for_sleep if read == 'property' else self.agent.session_manager_owner
-                    callback.side_effect = altered_read
-                    self.agent.release = mock.Mock(return_value=True)
                     login = types.SimpleNamespace(Suspend=mock.Mock())
-                    self.agent.proxy = mock.Mock(return_value=login)
-                    self.assertFalse(self.agent.sleep_now('Countdown elapsed'))
-                    self.agent.release.assert_not_called()
+                    def proxy(_bus, _owner, _path, interface):
+                        if interface == 'org.freedesktop.DBus':
+                            def get_owner(name, **kwargs):
+                                if name == agent_module.SESSION and read == 'owner':
+                                    mutate()
+                                kwargs['reply_handler'](':1.login' if name == agent_module.LOGIN
+                                                        else ':1.gnome')
+                            return types.SimpleNamespace(GetNameOwner=get_owner)
+                        if interface == 'org.freedesktop.DBus.Properties':
+                            def get(_name, _key, **kwargs):
+                                if read == 'property':
+                                    mutate()
+                                kwargs['reply_handler'](False)
+                            return types.SimpleNamespace(Get=get)
+                        if interface == 'org.freedesktop.login1.Manager':
+                            return login
+                        raise AssertionError('Unexpected preflight interface: ' + interface)
+                    self.agent.proxy = mock.Mock(side_effect=proxy)
+                    self.assertTrue(self.agent.sleep_now('Countdown elapsed'))
+                    self.agent.release_async.assert_not_called()
                     login.Suspend.assert_not_called()
 
     def test_failsafe_rechecks_power_after_inhibitor_release(self):
@@ -1751,16 +1842,16 @@ class AgentTests(unittest.TestCase):
             with self.subTest(attr=attr, value=value):
                 self.configure_low_battery()
                 self.agent.failsafe_triggered = False
-                def release():
+                self.allow_async_sleep_steps()
+                def release(callback, **_kwargs):
                     self.agent.enabled = False
                     setattr(self.agent, attr, value)
-                    return True
-                self.agent.release = mock.Mock(side_effect=release)
+                    callback(True)
+                self.agent.release_async.side_effect = release
                 login = types.SimpleNamespace(Suspend=mock.Mock())
                 self.agent.proxy = mock.Mock(return_value=login)
-                self.agent.refresh_power.reset_mock()
-                self.assertFalse(self.agent.sleep_now('Battery fell below the failsafe threshold'))
-                self.agent.refresh_power.assert_called_once_with(reconcile_lid=False)
+                self.assertTrue(self.agent.sleep_now('Battery fell below the failsafe threshold'))
+                self.assertEqual(self.agent.refresh_power_async.call_count, 2)
                 login.Suspend.assert_not_called()
                 self.assertTrue(self.agent.failsafe_triggered)
                 self.assertFalse(self.agent.desired)
@@ -1769,15 +1860,16 @@ class AgentTests(unittest.TestCase):
 
     def test_failsafe_stable_power_dispatches_once_after_effective_release(self):
         self.configure_low_battery()
-        def release():
+        self.allow_async_sleep_steps()
+        def release(callback, **_kwargs):
             self.agent.enabled = False
-            return True
-        self.agent.release = mock.Mock(side_effect=release)
+            callback(True)
+        self.agent.release_async.side_effect = release
         login = types.SimpleNamespace(Suspend=mock.Mock())
         self.agent.proxy = mock.Mock(return_value=login)
         self.assertTrue(self.agent.sleep_now('Battery fell below the failsafe threshold'))
         self.assertFalse(self.agent.enabled)
-        self.agent.refresh_power.assert_called_once_with(reconcile_lid=False)
+        self.assertEqual(self.agent.refresh_power_async.call_count, 2)
         agent_module.Agent.check_failsafe(self.agent)
         login.Suspend.assert_called_once()
         self.assertEqual(login.Suspend.call_args.args, (False,))
@@ -1788,18 +1880,18 @@ class AgentTests(unittest.TestCase):
 
     def test_failsafe_power_change_during_final_logind_read_blocks_dispatch(self):
         self.configure_low_battery()
-        self.agent.release = mock.Mock(return_value=True)
+        self.allow_async_sleep_steps()
         calls = 0
-        def preparing():
+        def preflight(callback, **_kwargs):
             nonlocal calls
             calls += 1
             if calls == 2:
                 self.agent.on_battery = False
-            return False
-        self.agent.preparing_for_sleep.side_effect = preparing
+            callback(True, '', ':1.login')
+        self.agent.suspend_preflight_async.side_effect = preflight
         login = types.SimpleNamespace(Suspend=mock.Mock())
         self.agent.proxy = mock.Mock(return_value=login)
-        self.assertFalse(self.agent.sleep_now('Battery fell below the failsafe threshold'))
+        self.assertTrue(self.agent.sleep_now('Battery fell below the failsafe threshold'))
         self.assertEqual(calls, 2)
         login.Suspend.assert_not_called()
         self.assertTrue(self.agent.failsafe_triggered)
@@ -1810,30 +1902,43 @@ class AgentTests(unittest.TestCase):
             with self.subTest(event=event):
                 self.configure_low_battery()
                 self.agent.shutting_down = False
-                self.agent.preparing_for_sleep.return_value = False
-                self.agent.release = mock.Mock(return_value=True)
-                def refresh(**kwargs):
-                    self.assertEqual(kwargs, {'reconcile_lid': False})
-                    if event == 'shutdown':
+                self.allow_async_sleep_steps()
+                def refresh(callback=None, **kwargs):
+                    self.assertFalse(kwargs['reconcile_lid'])
+                    if self.agent.refresh_power_async.call_count == 2 and event == 'shutdown':
                         self.agent.shutting_down = True
+                    callback(True)
+                def preflight(callback, **_kwargs):
+                    if self.agent.suspend_preflight_async.call_count == 2:
+                        callback(False, 'logind is preparing for sleep' if event == 'preparing'
+                                 else 'logind preparation is unreadable', '')
                     else:
-                        self.agent.preparing_for_sleep.return_value = True if event == 'preparing' else None
-                self.agent.refresh_power.side_effect = refresh
+                        callback(True, '', ':1.login')
+                self.agent.refresh_power_async.side_effect = refresh
+                self.agent.suspend_preflight_async.side_effect = preflight
                 login = types.SimpleNamespace(Suspend=mock.Mock())
                 self.agent.proxy = mock.Mock(return_value=login)
-                self.assertFalse(self.agent.sleep_now('Battery fell below the failsafe threshold'))
+                self.assertTrue(self.agent.sleep_now('Battery fell below the failsafe threshold'))
                 login.Suspend.assert_not_called()
                 self.assertEqual(self.agent.sleep_tx['phase'], 'idle')
+                self.assertEqual(self.agent.suspend_preflight_async.call_count,
+                                 1 if event == 'shutdown' else 2)
 
     def test_terminal_resolution_ignores_reentrant_prepare_signal(self):
         self.begin_request()
         self.agent.sleep_tx['saw_prepare_true'] = True
-        self.agent.refresh_power.side_effect = lambda **_kwargs: self.agent.on_prepare_sleep(False)
+        proxy, drain = self.queue_reconcile_bus(preparing=False)
+        def refresh(callback=None, **_kwargs):
+            self.agent.on_prepare_sleep(False)
+            callback(True)
+        self.agent.refresh_power_async.side_effect = refresh
         with mock.patch.object(agent_module, 'boottime', return_value=20), \
                 mock.patch.object(agent_module.time, 'monotonic', return_value=10):
             self.agent.reconcile_sleep_state('test')
+            drain()
         self.assertEqual(self.agent.sleep_tx['phase'], 'idle')
         self.assertEqual(self.agent.sleep_outcome, 'proven-resume')
+        self.assertEqual(proxy.call_count, 3)
         self.agent.notify.assert_called_once()
 
     def test_cancel_without_timer_is_idempotent(self):
@@ -1846,14 +1951,14 @@ class AgentTests(unittest.TestCase):
         self.agent.deadline = 5
         self.agent.timer_phase = 'running'
         self.agent.clock_gap = agent_module.ClockGapSample(0, 0, 0, 0)
-        self.agent.preparing_for_sleep.return_value = False
-        self.agent.proxy = mock.Mock()
+        proxy, drain = self.queue_reconcile_bus(preparing=False)
         with mock.patch.object(agent_module, 'boottime', return_value=20),                 mock.patch.object(agent_module.time, 'monotonic', return_value=10):
             self.agent.tick()
+            drain()
         self.assertIsNone(self.agent.deadline)
         self.assertEqual(self.agent.timer_phase, 'canceled')
         self.assertIn('expired during suspend', self.agent.timer_outcome)
-        self.agent.proxy.assert_not_called()
+        self.assertEqual(proxy.call_count, 3)
 
     def test_failsafe_rechecks_after_fresh_power_read(self):
         self.agent.enabled = True
@@ -1862,9 +1967,16 @@ class AgentTests(unittest.TestCase):
         self.agent.battery_discharge_state = 'discharging'
         self.agent.battery_percent = 5
         self.agent.sleep_now = mock.Mock()
-        self.agent.refresh_power.side_effect = lambda: setattr(self.agent, 'on_battery', False)
+        self.agent.suspend_preflight_async = mock.Mock(side_effect=lambda callback, **_kwargs:
+            callback(True, '', ':1.login'))
+        def refresh(callback=None, **_kwargs):
+            self.agent.on_battery = False
+            callback(True)
+        self.agent.refresh_power_async.side_effect = refresh
         self.agent.check_failsafe = agent_module.Agent.check_failsafe.__get__(self.agent)
         self.agent.check_failsafe()
+        self.agent.suspend_preflight_async.assert_called_once()
+        self.agent.refresh_power_async.assert_called_once()
         self.agent.sleep_now.assert_not_called()
 
     def power_devices(self, devices):
@@ -1955,7 +2067,8 @@ class AgentTests(unittest.TestCase):
                 self.agent.battery_percent = 5
                 self.agent.sleep_now = mock.Mock()
                 self.agent.check_failsafe = agent_module.Agent.check_failsafe.__get__(self.agent)
-                self.agent.refresh_power = mock.Mock()
+                self.agent.suspend_preflight_async = mock.Mock(
+                    side_effect=lambda callback, **_kwargs: callback(True, '', ':1.login'))
                 self.agent.check_failsafe()
                 self.agent.sleep_now.assert_called_once()
                 if isinstance(ambiguous, Exception):
@@ -1991,6 +2104,8 @@ class AgentTests(unittest.TestCase):
         self.agent.battery_percent = 5
         self.agent.sleep_now = mock.Mock()
         self.agent.check_failsafe = agent_module.Agent.check_failsafe.__get__(self.agent)
+        self.agent.suspend_preflight_async = mock.Mock(
+            side_effect=lambda callback, **_kwargs: callback(True, '', ':1.login'))
         self.agent.check_failsafe()
         self.agent.battery_percent = None
         self.agent.check_failsafe()
@@ -2000,7 +2115,8 @@ class AgentTests(unittest.TestCase):
         self.agent.sleep_now.assert_called_once()
         self.agent.failsafe_triggered = False
         self.agent.sleep_now.reset_mock()
-        self.agent.refresh_power.side_effect = lambda: setattr(self.agent, 'battery_discharge_state', 'unknown')
+        self.agent.refresh_power_async.side_effect = lambda callback=None, **_kwargs: (
+            setattr(self.agent, 'battery_discharge_state', 'unknown'), callback(True))
         self.agent.check_failsafe()
         self.agent.sleep_now.assert_not_called()
 
@@ -2511,6 +2627,12 @@ class AgentTests(unittest.TestCase):
         self.agent.shutting_down = True
         agent_module.Agent.notify(self.agent, 'Summary', 'Body')
         remote.Notify.assert_called_once()
+
+    def test_notification_setup_failure_does_not_interrupt_caller(self):
+        self.agent.session_bus = types.SimpleNamespace(get_is_connected=lambda: True)
+        self.agent.proxy = mock.Mock(side_effect=TypeError('notification proxy unavailable'))
+        agent_module.Agent.notify(self.agent, 'Summary', 'Body')
+        self.agent.proxy.assert_called_once()
 
     def test_repeated_prevention_enable_keeps_healthy_inhibitors(self):
         a = self.agent
@@ -3936,6 +4058,21 @@ class AgentTests(unittest.TestCase):
         self.agent.release_async = mock.Mock(side_effect=lambda callback, **_kwargs: callback(True))
         login = types.SimpleNamespace(Suspend=mock.Mock(side_effect=FakeDBusException(
             'reply lost', name='org.freedesktop.DBus.Error.NoReply')))
+        self.agent.proxy = mock.Mock(return_value=login)
+        self.assertTrue(self.agent.sleep_now('Countdown elapsed'))
+        self.assertEqual(self.agent.suspend_request_outcome, 'unknown')
+        self.assertEqual(self.agent.sleep_tx['request_reply'], 'unknown')
+        self.assertFalse(self.agent.sleep_now('Countdown elapsed'))
+        login.Suspend.assert_called_once()
+
+    def test_async_unexpected_suspend_setup_error_remains_unknown(self):
+        self.agent.deadline = 10
+        self.agent.timer_phase = 'running'
+        self.agent.suspend_preflight_async = mock.Mock(
+            side_effect=lambda callback, **_kwargs: callback(True, '', ':1.login'))
+        self.agent.release_async = mock.Mock(side_effect=lambda callback, **_kwargs: callback(True))
+        login = types.SimpleNamespace(Suspend=mock.Mock(
+            side_effect=TypeError('unexpected marshalling failure')))
         self.agent.proxy = mock.Mock(return_value=login)
         self.assertTrue(self.agent.sleep_now('Countdown elapsed'))
         self.assertEqual(self.agent.suspend_request_outcome, 'unknown')
