@@ -768,6 +768,7 @@ class AgentTests(unittest.TestCase):
         a.dimming_disable_requests = set()
         a.lid_error = ''
         a.last_error = ''
+        a.acquisition_error = ''
         a.enabled = False
         a.desired = False
         a.lid_mode = False
@@ -2729,6 +2730,37 @@ class AgentTests(unittest.TestCase):
         self.assertIsInstance(second[0], FakeDBusException)
         self.assertIsNone(a.prevention_acquisition)
 
+    def test_acquisition_success_preserves_unrelated_diagnostic(self):
+        a = self.agent
+        a.desired = True
+        a.last_error = 'Could not save preferences: disk unavailable'
+        a.handle_lid_change = mock.Mock()
+        names = types.SimpleNamespace(GetNameOwner=mock.Mock(side_effect=lambda name, **kwargs:
+            kwargs['reply_handler'](':1.gnome' if name == agent_module.SESSION else ':1.login')))
+        login = types.SimpleNamespace(Inhibit=mock.Mock(side_effect=lambda *_args, **kwargs:
+            kwargs['reply_handler'](types.SimpleNamespace(take=lambda: 42))))
+        gnome = types.SimpleNamespace(Inhibit=mock.Mock(side_effect=lambda *_args, **kwargs:
+            kwargs['reply_handler'](agent_module.dbus.UInt32(7))))
+        a.proxy = mock.Mock(side_effect=lambda _bus, owner, _path, _interface:
+            names if owner == 'org.freedesktop.DBus' else
+            login if owner == ':1.login' else gnome)
+        results = []
+        a.acquire_async(results.append)
+        self.assertEqual(results, [None])
+        self.assertTrue(a.enabled)
+        self.assertEqual(a.last_error, 'Could not save preferences: disk unavailable')
+
+        a.enabled = False
+        a.fd = None
+        a.session_cookie = None
+        a.session_cookie_state = 'absent'
+        a.acquisition_error = 'Prevention acquisition exceeded its deadline'
+        a.last_error = a.acquisition_error
+        results.clear()
+        a.acquire_async(results.append)
+        self.assertEqual(results, [None])
+        self.assertEqual(a.last_error, '')
+
     def test_remote_healthy_prevention_repetition_rechecks_fresh_power(self):
         a = self.agent
         a.session_cookie = 7
@@ -4026,12 +4058,37 @@ class AgentTests(unittest.TestCase):
         self.assertEqual(state['sleepOutcome'], 'logind-state-unreadable')
         self.assertEqual(state['suspendRequestOutcome'], 'unknown')
 
+    def test_timer_start_preserves_unrelated_diagnostic(self):
+        a = self.agent
+        a.last_error = 'GNOME inhibitor release is pending; retry required'
+        reply, error = mock.Mock(), mock.Mock()
+        a.StartTimer(60, False, False, reply=reply, error=error)
+        reply.assert_called_once_with()
+        error.assert_not_called()
+        self.assertEqual(a.last_error, 'GNOME inhibitor release is pending; retry required')
+
+        a.last_error = 'Could not save preferences: previous write failed'
+        a.StartTimer(120, False, False, reply=reply, error=error)
+        self.assertEqual(reply.call_count, 2)
+        error.assert_not_called()
+        self.assertEqual(a.last_error, '')
+
+        a.last_error = 'Could not save preferences: previous write failed'
+        warning = 'Preferences saved, but directory durability is uncertain: fsync failed'
+        a.persist_settings = mock.Mock(side_effect=lambda **_changes:
+                                       setattr(a, 'last_error', warning))
+        a.StartTimer(180, False, False, reply=reply, error=error)
+        self.assertEqual(reply.call_count, 3)
+        error.assert_not_called()
+        self.assertEqual(a.last_error, warning)
+
     def test_async_timer_dispatches_once_after_release_and_final_preflight(self):
         self.agent.deadline = 10
         self.agent.timer_phase = 'running'
         self.agent.require_lid = True
         self.agent.lid_closed = True
         self.agent.enabled = self.agent.desired = True
+        self.agent.last_error = 'Unrelated persistence failure'
         preflights = []
 
         def preflight(callback, **kwargs):
@@ -4055,9 +4112,24 @@ class AgentTests(unittest.TestCase):
                          [False, True])
         self.assertIsNone(self.agent.deadline)
         self.assertEqual(self.agent.timer_phase, 'consumed')
+        self.assertEqual(self.agent.last_error, 'Unrelated persistence failure')
         login.Suspend.call_args.kwargs['reply_handler']()
         self.assertEqual(self.agent.suspend_request_outcome, 'accepted')
         self.assertEqual(self.agent.sleep_tx['phase'], 'request-pending')
+        self.assertEqual(self.agent.last_error, 'Unrelated persistence failure')
+
+    def test_accepted_suspend_reply_clears_only_previous_suspend_diagnostic(self):
+        a = self.agent
+        a.last_error = 'Suspend request rejected: previous attempt'
+        tx = a.begin_sleep_request('timer', 'Countdown elapsed')
+        a.finish_suspend_request(tx, 'timer')
+        self.assertEqual(a.last_error, '')
+        self.assertEqual(a.suspend_request_outcome, 'accepted')
+
+        a.last_error = 'Unrelated persistence failure'
+        tx = a.begin_sleep_request('timer', 'Countdown elapsed')
+        a.finish_suspend_request(tx, 'timer')
+        self.assertEqual(a.last_error, 'Unrelated persistence failure')
 
     def test_async_timer_lid_change_after_release_blocks_suspend(self):
         self.agent.deadline = 10

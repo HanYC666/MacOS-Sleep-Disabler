@@ -313,6 +313,7 @@ class Agent(dbus.service.Object):
         self.require_lid = False
         self.require_prevention = False
         self.last_error = ""
+        self.acquisition_error = ""
         self.lid_error = ""
         self.timer_outcome = ""
         self.clock_gap = sample_clock_gap()
@@ -1828,7 +1829,9 @@ class Agent(dbus.service.Object):
             self.inhibitor_outcome = 'held'
             self.release_attempts = 0
             self.enabled = True
-            self.last_error = ""
+            if self.acquisition_error and self.last_error == self.acquisition_error:
+                self.last_error = ""
+            self.acquisition_error = ""
             if self.lid_mode:
                 self.retry_lid_lock()
             self.handle_lid_change()
@@ -1840,6 +1843,7 @@ class Agent(dbus.service.Object):
             released = self.release()
             self.last_error = failure if released else (
                 'GNOME inhibitor release uncertain: ' + failure + '; cleanup: ' + self.last_error)
+            self.acquisition_error = self.last_error
             if gnome_call_started and not cookie_received:
                 self.desired = False
                 self.disconnect_session_bus(
@@ -1898,6 +1902,7 @@ class Agent(dbus.service.Object):
             cancelled = self.dbus_error_name(failure) == IFACE + '.Canceled'
             if not cancelled:
                 self.last_error = message
+                self.acquisition_error = message
             if operation['cookie'] is not None:
                 if not self.session_bus.get_is_connected():
                     self.clear_session_cookie('session-bus-disconnected')
@@ -1912,8 +1917,15 @@ class Agent(dbus.service.Object):
                 def cleaned(released):
                     if not released:
                         self.last_error = ('GNOME inhibitor release uncertain: ' + message)
+                        self.acquisition_error = self.last_error
                     else:
-                        self.last_error = '' if cancelled else message
+                        if cancelled:
+                            if self.acquisition_error and self.last_error == self.acquisition_error:
+                                self.last_error = ''
+                            self.acquisition_error = ''
+                        else:
+                            self.last_error = message
+                            self.acquisition_error = message
                     finish_waiters(dbus.DBusException(message if cancelled else self.last_error,
                         name=IFACE + ('.Unavailable' if released else '.ReleasePending')))
                 self.release_async(cleaned)
@@ -2007,7 +2019,9 @@ class Agent(dbus.service.Object):
                 self.session_owner_generation += 1
                 self.release_attempts = 0
                 self.enabled = True
-                self.last_error = ''
+                if self.acquisition_error and self.last_error == self.acquisition_error:
+                    self.last_error = ''
+                self.acquisition_error = ''
                 try:
                     if self.lid_mode:
                         self.retry_lid_lock()
@@ -3135,7 +3149,6 @@ class Agent(dbus.service.Object):
                 finish('timer requires a confirmed closed lid')
                 return
             LOG.info('Requesting suspend: %s', reason)
-            self.last_error = ''
             finish()
             transaction = self.begin_sleep_request(origin, reason)
             try:
@@ -3230,6 +3243,10 @@ class Agent(dbus.service.Object):
         if failure is None:
             if not self.record_sleep_request_reply(transaction, 'accepted'):
                 return
+            if self.last_error.startswith((
+                    'Suspend not requested:', 'Suspend request rejected:',
+                    'Suspend request outcome unknown:')):
+                self.last_error = ''
             if origin == 'timer':
                 self.timer_outcome = 'Countdown consumed; suspend request accepted'
             self.publish()
@@ -4762,6 +4779,7 @@ class Agent(dbus.service.Object):
                 self.finish_timer_start(operation, failure)
                 return
             try:
+                prior_error = self.last_error
                 self.persist_settings(timer_minutes=seconds // 60,
                                       timer_require_lid=bool(require_lid),
                                       timer_require_prevention=bool(require_prevention))
@@ -4775,7 +4793,11 @@ class Agent(dbus.service.Object):
                 self.require_lid = bool(require_lid)
                 self.require_prevention = bool(require_prevention)
                 self.timer_outcome = ''
-                self.last_error = ''
+                if self.last_error == prior_error and prior_error.startswith((
+                        'Could not save preferences:',
+                        'Preferences saved, but directory durability is uncertain:',
+                        'Preferences could not be loaded; defaults are active:')):
+                    self.last_error = ''
             except Exception as failure:
                 self.finish_timer_start(operation, failure)
                 return
