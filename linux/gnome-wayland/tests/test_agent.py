@@ -1810,25 +1810,35 @@ class AgentTests(unittest.TestCase):
                         else:
                             self.agent.session_cookie_state = 'release-pending'
                     login = types.SimpleNamespace(Suspend=mock.Mock())
+                    pending = []
                     def proxy(_bus, _owner, _path, interface):
                         if interface == 'org.freedesktop.DBus':
                             def get_owner(name, **kwargs):
-                                if name == agent_module.SESSION and read == 'owner':
-                                    mutate()
-                                kwargs['reply_handler'](':1.login' if name == agent_module.LOGIN
-                                                        else ':1.gnome')
+                                def deliver():
+                                    if name == agent_module.SESSION and read == 'owner':
+                                        mutate()
+                                    kwargs['reply_handler'](':1.login' if name == agent_module.LOGIN
+                                                            else ':1.gnome')
+                                pending.append(deliver)
                             return types.SimpleNamespace(GetNameOwner=get_owner)
                         if interface == 'org.freedesktop.DBus.Properties':
                             def get(_name, _key, **kwargs):
-                                if read == 'property':
-                                    mutate()
-                                kwargs['reply_handler'](False)
+                                def deliver():
+                                    if read == 'property':
+                                        mutate()
+                                    kwargs['reply_handler'](False)
+                                pending.append(deliver)
                             return types.SimpleNamespace(Get=get)
                         if interface == 'org.freedesktop.login1.Manager':
                             return login
                         raise AssertionError('Unexpected preflight interface: ' + interface)
                     self.agent.proxy = mock.Mock(side_effect=proxy)
                     self.assertTrue(self.agent.sleep_now('Countdown elapsed'))
+                    self.assertEqual(len(pending), 1)
+                    self.agent.release_async.assert_not_called()
+                    while pending:
+                        pending.pop(0)()
+                    self.assertEqual(self.agent.proxy.call_count, 2 if read == 'property' else 3)
                     self.agent.release_async.assert_not_called()
                     login.Suspend.assert_not_called()
 
@@ -1908,21 +1918,41 @@ class AgentTests(unittest.TestCase):
                     if self.agent.refresh_power_async.call_count == 2 and event == 'shutdown':
                         self.agent.shutting_down = True
                     callback(True)
+                pending = []
                 def preflight(callback, **_kwargs):
                     if self.agent.suspend_preflight_async.call_count == 2:
-                        callback(False, 'logind is preparing for sleep' if event == 'preparing'
-                                 else 'logind preparation is unreadable', '')
+                        agent_module.Agent.suspend_preflight_async(
+                            self.agent, callback, **_kwargs)
                     else:
                         callback(True, '', ':1.login')
+                def proxy(_bus, _owner, _path, interface):
+                    if interface == 'org.freedesktop.DBus':
+                        return types.SimpleNamespace(GetNameOwner=lambda _name, **kwargs:
+                            pending.append(lambda: kwargs['reply_handler'](':1.login')))
+                    if interface == 'org.freedesktop.DBus.Properties':
+                        return types.SimpleNamespace(Get=lambda _name, _key, **kwargs:
+                            pending.append(lambda: kwargs['reply_handler'](
+                                True if event == 'preparing' else None)))
+                    raise AssertionError('Final preflight passed an unreadable preparation state')
                 self.agent.refresh_power_async.side_effect = refresh
                 self.agent.suspend_preflight_async.side_effect = preflight
-                login = types.SimpleNamespace(Suspend=mock.Mock())
-                self.agent.proxy = mock.Mock(return_value=login)
+                self.agent.release_async.side_effect = lambda callback, **_kwargs: (
+                    setattr(self.agent, 'enabled', False), callback(True))
+                self.agent.proxy = mock.Mock(side_effect=proxy)
                 self.assertTrue(self.agent.sleep_now('Battery fell below the failsafe threshold'))
-                login.Suspend.assert_not_called()
+                if event != 'shutdown':
+                    self.assertEqual(len(pending), 1)
+                    while pending:
+                        pending.pop(0)()
                 self.assertEqual(self.agent.sleep_tx['phase'], 'idle')
                 self.assertEqual(self.agent.suspend_preflight_async.call_count,
                                  1 if event == 'shutdown' else 2)
+                self.assertEqual(self.agent.proxy.call_count,
+                                 0 if event == 'shutdown' else 2)
+                if event == 'preparing':
+                    self.assertIn('logind is preparing for sleep', self.agent.last_error)
+                elif event == 'unknown-preparing':
+                    self.assertIn('D-Bus read failed', self.agent.last_error)
 
     def test_terminal_resolution_ignores_reentrant_prepare_signal(self):
         self.begin_request()
