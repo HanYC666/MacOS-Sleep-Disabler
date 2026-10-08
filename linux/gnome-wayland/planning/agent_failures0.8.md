@@ -69,6 +69,45 @@ Source: the isolated pre-plan-0.8 full run of 206 tests. This is a **provisional
 
 For each row: identify the original safety invariant; drive or reason through queued callbacks, absolute deadline, and owner generation; update only obsolete observation points; repair production code for a real invariant violation; record two review passes in `../task.md`. Do not claim full-suite pass while execution remains prohibited.
 
+## Case-to-invariant crosswalk (source review, not behavior resolution)
+
+The test line and immediate failed assertion for each numbered variant are in the inventory above. The groups below assign every row an invariant and a proposed repair or observation point. Rows 1, 3, and 7 are demonstrably obsolete *calls* to the removed synchronous method; rows 2, 4, 5, and 6 are demonstrably incomplete bus fakes. The 53 assertion failures remain **unresolved** as to final cause: their old synchronous observation points are suspect, but a genuine runtime defect is still possible until the queued behavior cases can be run. A proposed fixture migration never changes the safety invariant.
+
+| Rows | Preserved invariant | Proposed repair / current observation point |
+| --- | --- | --- |
+| 1 | A logind replacement requires a fresh readable owner/property/capability preflight. | Drive `suspend_preflight_async` with queued owner/property/capability replies; reject stale owner before release or request. |
+| 2 | Owner loss cancels a pending release retry without leaking the cookie boundary. | Supply a connected fake session bus and fire owner-loss before the queued release callback. |
+| 3 | A cookie held by a different GNOME owner cannot authorize release. | Use callback preflight and deliver the mismatched `GetNameOwner` reply explicitly. |
+| 4 | Three total failed release attempts end with a session-bus disconnect. | Give the fake `get_is_connected`, queue each owner/`Uninhibit` result, and advance retry sources exactly twice. |
+| 5 | One failed release creates exactly one five-second retry source. | Use a connected fake and observe the agent source ID after the asynchronous owner and release failures. |
+| 6 | A successful retry clears pending release and cancels further work. | Deliver the second `Uninhibit` success and check cookie/source state and no late retry. |
+| 7 | An uncertain sleep latch blocks failsafe and direct preflight. | Invoke callback preflight under the latch; retain no-release and no-`Suspend` assertions. |
+| 8–9 | Accepted request plus preparation signals or their absence settles once to the conservative outcome. | Drain owner → `PreparingForSleep` → final-owner reads before asserting `failed-preparation` or `accepted-no-suspend`. |
+| 10–13 | Every ambiguous D-Bus error variant leaves the request unknown and cannot trigger a second automatic request. | Complete the async attempt prerequisites, deliver the named error, then queued reconciliation reads; assert one dispatch and an unknown latch for each error name. |
+| 14 | A clock gap does not resolve while logind still says it is preparing. | Deliver a queued `PreparingForSleep=true` read before inspecting the transaction phase. |
+| 15–16 | A false or unknown fresh lid value rejects a lid-required timer before dispatch. | Observe staged attempt separately from `Suspend` call count after the fresh power callback. |
+| 17–20 | A lid change during release or final preflight blocks dispatch. | Inject each listed lid value at its named callback boundary; assert no `Suspend` after the final guard. |
+| 21 | Lost effective prevention before release blocks a prevention-required timer. | Mutate `enabled` before the initial preflight continuation, then inspect release/dispatch calls. |
+| 22 | Stable timer conditions dispatch exactly once after confirmed release. | Advance first preflight, release, and final preflight callbacks before asserting the one request. |
+| 23–26 | Each named definite rejection resolves as rejected, with no retry. | Deliver each named `Suspend` error after dispatch and assert the transaction result and one call. |
+| 27–29 | Shutdown, confirmed preparation, and unreadable preparation each block the final failsafe guard. | Inject the event before the queued final owner/property read; preserve distinct rejection reasons and no dispatch. |
+| 30 | A power change during the final logind read blocks a failsafe request. | Mutate power while the final preflight callback is queued; inspect the final power guard and dispatch count. |
+| 31–37 | Each listed unsafe or unknown post-release battery/failsafe value blocks dispatch. | Deliver a fresh post-release power snapshot with that exact value; assert no `Suspend` for every variant. |
+| 38 | Stable failsafe power dispatches only once after effective release. | Advance post-release power and final preflight explicitly, then assert one request and a consumed episode. |
+| 39–40 | False/true signal order converges in one transaction; false alone settles conservatively. | Queue owner/property/final-owner reads before the signal, deliver them in order, and check final classification. |
+| 41 | A later false can settle an unreadable latch after the settle interval. | Deliver an unreadable read followed by a later queued false; keep the no-retry assertion. |
+| 42 | A low-battery episode cannot retry after an ambiguous suspend reply. | Drive both async failsafe preflights, fresh power, dispatch, error, and reconciliation before asserting one request. |
+| 43 | Missing percentage preserves episode state; fresh unknown evidence blocks dispatch. | Deliver the fresh power callback with missing percentage and inspect episode/dispatch separately. |
+| 44–50 | Shutdown, transaction, owner-generation, or cookie mutation during either named preflight read invalidates authorization. | Change state immediately before the queued owner/property callback; require no release and no request for every variant. |
+| 51 | Proven external suspend consumes an overdue active timer without a second request. | Install the queued reconciliation bus before tick, deliver its reads, then inspect deadline and request count. |
+| 52–53 | A reentrant prepare or wake signal cannot be overwritten or resurrected by a later method reply. | Deliver the signal during the request callback path, then the late reply; assert single transaction identity. |
+| 54 | Repeated false after resolution is idempotent. | Complete the first queued reconciliation, deliver another false, and assert unchanged terminal outcome. |
+| 55 | Any state change between release and the final guard prevents dispatch. | Inject the change at the final preflight boundary and assert no `Suspend`. |
+| 56–59 | Every listed ambiguous low-battery evidence sequence consumes one episode and dispatches at most once. | Drive asynchronous prerequisite callbacks for each exact variant; check first request and no repeated dispatch. |
+| 60 | Unknown request plus false and no clock gap stays unknown, never definite rejection. | Drain the queued logind reads after the ambiguous reply and retain unknown classification. |
+
+This crosswalk covers rows 1–60 exactly once. It is a source-level migration map; it does not check any `Resolved` box or establish a full-suite pass.
+
 Initial source migration: rows 1, 3, and 7 now call `suspend_preflight_async`, with a fake callback-only proxy for the readable/owner-mismatch cases. Rows 2, 5, and 6 now inherit a session-bus fake with `get_is_connected`; row 4's explicit bus fake has that method too. Rows 4–6 additionally drive the actual async owner lookup and `Uninhibit` callbacks through a pinned fake GNOME owner, retaining the one-source, two-attempt success, and three-attempt disconnect checks. The code compiles, but these seven cases remain unchecked because the current user instruction prohibits executing sleep-functionality tests. Their original behavioral assertions still need the full callback and retry review.
 
 Rows 8–9 now use a queued fake logind owner → `PreparingForSleep` → final-owner read and keep their accepted-without-suspend/failed-preparation outcomes. The queue is explicitly drained by the fixture; it is never connected to live D-Bus. These rows remain unchecked until the prohibited behavior can be run or otherwise proven through the complete source audit.
