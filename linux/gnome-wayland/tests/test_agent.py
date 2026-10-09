@@ -1267,9 +1267,27 @@ class AgentTests(unittest.TestCase):
         self.agent.session_cookie_state = 'release-pending'
         self.agent.release_retry_source = fake_glib.timeout_add_seconds(5, lambda: False)
         source = self.agent.release_retry_source
+        names = types.SimpleNamespace(GetNameOwner=mock.Mock(side_effect=lambda _name, **kwargs:
+            kwargs['error_handler'](FakeDBusException(
+                'unique owner gone', name='org.freedesktop.DBus.Error.NameHasNoOwner'))))
+        self.agent.proxy = mock.Mock(return_value=names)
         self.agent.on_owner_change(agent_module.SESSION, ':1.gnome', ':1.new')
         self.assertEqual(self.agent.session_cookie_state, 'absent')
+        self.assertEqual(self.agent.release_retry_source, 0)
         self.assertIn(source, fake_glib.removed)
+        names.GetNameOwner.assert_called_once()
+        self.assertEqual(names.GetNameOwner.call_args.args, (':1.gnome',))
+
+    def test_session_name_change_releases_old_unique_owner_cookie(self):
+        self.held_cookie()
+        names, gnome = self.fake_release_proxy(lambda _cookie, **kwargs:
+            kwargs['reply_handler']())
+        self.agent.on_owner_change(agent_module.SESSION, ':1.gnome', ':1.new')
+        names.GetNameOwner.assert_called_once()
+        self.assertEqual(names.GetNameOwner.call_args.args, (':1.gnome',))
+        gnome.Uninhibit.assert_called_once()
+        self.assertEqual(gnome.Uninhibit.call_args.args, (7,))
+        self.assertEqual(self.agent.session_cookie_state, 'absent')
 
     def test_stop_cancels_release_source(self):
         self.agent.release_retry_source = fake_glib.timeout_add_seconds(5, lambda: False)
@@ -1569,6 +1587,15 @@ class AgentTests(unittest.TestCase):
                 self.agent.notify.reset_mock()
 
     def test_low_battery_episode_never_retries_ambiguous_suspend(self):
+        now = [0]
+        monotonic_clock = mock.patch.object(agent_module.time, 'monotonic',
+                                            side_effect=lambda: now[0])
+        boot_clock = mock.patch.object(agent_module, 'boottime',
+                                       side_effect=lambda: now[0])
+        monotonic_clock.start()
+        self.addCleanup(monotonic_clock.stop)
+        boot_clock.start()
+        self.addCleanup(boot_clock.stop)
         self.agent.enabled = True
         self.agent.failsafe = True
         self.agent.on_battery = True
@@ -1581,9 +1608,9 @@ class AgentTests(unittest.TestCase):
         self.agent.check_failsafe = agent_module.Agent.check_failsafe.__get__(self.agent)
 
         self.agent.check_failsafe()
-        with mock.patch.object(agent_module, 'boottime', return_value=6), \
-                mock.patch.object(agent_module.time, 'monotonic', return_value=6):
-            self.drive_reconcile('settled', preparing=False)
+        now[0] = 6
+        self.drive_reconcile('settled', preparing=False)
+        self.assertEqual(self.agent.sleep_tx['phase'], 'idle')
         self.agent.proxy = mock.Mock(return_value=login)
         self.agent.check_failsafe()
         self.assertEqual(login.Suspend.call_count, 1)
@@ -1597,6 +1624,7 @@ class AgentTests(unittest.TestCase):
         self.agent.battery_percent = 30
         self.agent.check_failsafe()
         self.agent.battery_percent = 5
+        now[0] = 7
         self.agent.check_failsafe()
         self.assertEqual(login.Suspend.call_count, 2)
 

@@ -1,15 +1,15 @@
 # Plan 0.8 — reconcile the agent regression suite and close the 0.6/0.7 review
 
-Status: **planning complete; implementation and verification outstanding**. Commit `422e07b` records the 0.6/0.7 work. A later isolated execution found 53 assertion failures and seven errors in the full 206-case agent suite, while a selected 91-case group of recent callback-path tests passed. Those counts are evidence of a broken regression suite, not proof that every failure is only a test defect. Preserve all 0.6/0.7 safety requirements while resolving each case. The other isolated suites passed at that point: core installer 84 with one skip, shell installer 44, CLI five, and the actual-extension GJS harness. This plan does not turn those selected results into a whole-stack sign-off.
+Status: **fake-service implementation and isolated verification complete; delivery and live gates remain open**. Commit `422e07b` records the 0.6/0.7 work. The pre-0.8 full run found 53 assertion failures and seven errors in 206 agent cases. After callback-fixture migration and two final fixture corrections, the isolated fake-bus agent suite passed all 212 current cases on 2026-10-09. That proves current fake-path assertions, not live GNOME or hardware behavior. The current core installer suite passed 84 cases with one skip, CLI passed five, and the GJS panel harness passed. The shell installer suite exceeded a 240-second serial limit, then all 44 cases passed when partitioned into four independent 11-case temporary-home shards; no single serial run is claimed.
 
-The user currently permits code execution but forbids testing sleep functionality or any scheduling and forbids actually sleeping the laptop. Accordingly, source review, compilation, syntax checks, read-only API probes, and unrelated isolated tests are permitted; timer, failsafe, suspend, lid-close, and scheduling behavior tests remain unrun. Do not invoke `Suspend`, `systemctl suspend`, a live timer, or a live lid-close path. A source-only final walkthrough is required after implementation. The requested GitHub push is a separate delivery gate; the first attempt failed because this environment has no GitHub credentials.
+The user now permits **isolated fake-bus sleep and scheduling tests that cannot suspend the laptop**. The agent test module installs fake `dbus` and GLib modules before importing production code; it has no live bus constructor, and `Suspend` is a mock. Do not invoke a live `Suspend`, `systemctl suspend`, timer, or lid-close path. A separate source-only final walkthrough is required after implementation. The user chose to leave commits local for now, so the remote push is deferred.
 
 ## 1. Required result and evidence rules
 
 1. Read the current code and recent Git history before edits. Map all 0.6 F1–F8 and 0.7 sections to current source, existing fixtures, and the old ledger. Treat old ledger claims as leads, not proof; inspect current state.
 2. Replace `../task.md` with a detailed, persistent ledger **before implementation edits**. Record each subtask, acceptance criteria, current evidence, two independent review passes, and unperformed gates. Only check a subtask after the implementation and both passes are complete. Preserve the file after completion.
 3. Classify all 60 failing/error cases by name and cause. Record a case-by-case inventory: obsolete synchronous expectation, inadequate fake bus/callback driving, genuine source defect, or uncertain. Do not skip, delete, rename, or weaken a test merely to make the suite green. Preserve its original invariant when migrating it to the asynchronous API.
-4. Audit the full 206-case suite structurally and count tests with `unittest` discovery or AST inspection without executing sleep/scheduling tests. Keep a manifest of those excluded by the user's instruction and of permitted nonscheduling tests. A selected passing subset is never described as the full suite passing.
+4. Audit the historical 206-case suite and current test selection structurally. The user's later permission allows the complete isolated fake-bus agent suite; record its exact current count and result separately from the historical 206-case failure result. Never describe a selected subset or a live gate as covered by fake tests.
 5. At completion, match each plan 0.6 and 0.7 requirement to current source and appropriate evidence. An unrun fixture or live gate stays visibly open. Do not claim the goal or the whole regression suite complete from source review alone.
 
 ## 2. Regression-test migration: retain behavior, update the harness
@@ -51,20 +51,20 @@ Any discovered defect gets a minimal production repair, corresponding regression
 
 ## 5. Permitted verification and two review passes
 
-1. Run source/AST checks, Python compilation, shell syntax, diff whitespace, and nonscheduling isolated suites. Run the installer, CLI, core installer, and GJS harness only with fake services and no live deployment. Do **not** run the full agent suite or new timer/failsafe/suspend cases under the current restriction; label those fixtures unexecuted. If a nonscheduling subset is run, state exactly how it was selected.
+1. Run source/AST checks, Python compilation, shell syntax, diff whitespace, and isolated fake-service suites. The user now permits the complete fake-bus agent suite, including timer/failsafe/suspend simulation, provided it cannot connect to live D-Bus or suspend the laptop. Run installer, CLI, core installer, and GJS harnesses only with fake services and no live deployment. Record each completed count and any bounded timeout separately.
 2. Probe API availability read-only: local dbus-python/GLib/GJS signatures and, if useful, `Introspect`/`Get`/owner queries against safe endpoints. Do not call mutating API methods or set logind policy. Distinguish host API existence from target Kali/GNOME behavior.
 3. Pass 1: requirement → code → fixture/source evidence for every 0.6/0.7/0.8 row; check old failure manifest against migrated cases and compare exact result semantics. Resolve all source-level findings.
-4. Pass 2: an independent adversarial walkthrough from installer → running service → Shell panel → user mutation → power/lid changes → automatic attempt → wake/unknown state → shutdown/rollback. Check callback reorder, timeout just before source firing, owner replacement, stale resources, and partial writes without executing sleep/scheduling tests. Record new findings and repeat both passes for affected paths.
-5. Final separate **no-code-execution** logical review of the complete stack from the top. Read the final files, not only diffs. Record exact limitations. Leave live sleep, physical lid/panel, target-distro, and excluded agent behavior gates open; do not mark the goal achieved unless all requested requirements actually have proof.
+4. Pass 2: an independent adversarial walkthrough from installer → running service → Shell panel → user mutation → power/lid changes → automatic attempt → wake/unknown state → shutdown/rollback. Check callback reorder, timeout just before source firing, owner replacement, stale resources, and partial writes. Fake sleep/scheduling tests are permitted; live behavior is not. Record new findings and repeat both passes for affected paths.
+5. Final separate **no-code-execution** logical review of the complete stack from the top. Read the final files, not only diffs. Record exact limitations. Leave live sleep, physical lid/panel, target-distro, and remote-delivery gates open; do not mark the goal achieved unless all requested requirements actually have proof.
 
 ## 6. Delivery and completion checklist
 
-- [ ] Current code and history inventoried; old 60 failures/errors classified individually.
-- [ ] `../task.md` replaced before implementation edits and retained with granular checked/unchecked subtasks and two review passes.
-- [ ] Old fixtures migrated without weakening safety invariants; any genuine source defects fixed.
-- [ ] Plans 0.6 and 0.7 rechecked requirement by requirement against final source.
-- [ ] Permitted isolated verification passes; prohibited sleep/scheduling cases and all live gates are honestly open.
-- [ ] Full source-only stack review finds no remaining concrete logical defect.
+- [x] Current code and history inventoried; all 60 old failure/error variants mapped to current passing fake cases. Historical source/fixture causation was not bisected.
+- [x] `../task.md` replaced before implementation edits and retained with granular checked/unchecked subtasks and two review passes.
+- [x] Old fixtures migrated without weakening safety invariants; concrete source defects found during migration fixed and covered.
+- [x] Plans 0.6 and 0.7 rechecked requirement by requirement against final source.
+- [x] Permitted isolated verification passes; fake sleep/scheduling coverage and all live gates are honestly distinguished.
+- [x] Full source-only stack review found no remaining concrete logical defect; live proof remains open.
 - [ ] Requested commit is pushed to the configured remote after authentication is available; Git state proves it.
 
 Source context: [systemd login1 D-Bus API](https://www.freedesktop.org/software/systemd/man/latest/org.freedesktop.login1.html), [logind lid configuration](https://www.freedesktop.org/software/systemd/man/latest/logind.conf.html), [systemd inhibitor locks](https://github.com/systemd/systemd/blob/main/docs/INHIBITOR_LOCKS.md), and [Mutter overview](https://gnome.pages.gitlab.gnome.org/mutter/).

@@ -1,6 +1,6 @@
 # GNOME Wayland prototype
 
-This is a per-user prototype of Sleep Disabler for GNOME Wayland on Debian-family distributions. It uses a Python agent plus a GNOME Shell extension. The current source identifies agent runtime `0.6.0`, D-Bus API `6`, and panel runtime/metadata `6`; the installer requires these exact active versions. The agent starts with sleep prevention **off** on every fresh process start. It does not edit `logind.conf`, GNOME power settings, kernel sleep state, or system files. Isolated installer and API checks have passed, while the current full state-machine and scheduling behavior remains unverified. It has not yet been run in a Linux GNOME session.
+This is a per-user prototype of Sleep Disabler for GNOME Wayland on Debian-family distributions. It uses a Python agent plus a GNOME Shell extension. The current source identifies agent runtime `0.6.0`, D-Bus API `6`, and panel runtime/metadata `6`; the installer requires these exact active versions. The agent starts with sleep prevention **off** on every fresh process start. It does not edit `logind.conf`, GNOME power settings, kernel sleep state, or system files. The isolated fake-bus agent suite, including sleep and scheduling simulations, and the installer, CLI, and panel harnesses pass. Live state-machine, scheduling, GNOME session, and hardware behavior remain unverified. It has not yet been run in a Linux GNOME session.
 
 ## Install on the GNOME Wayland machine
 
