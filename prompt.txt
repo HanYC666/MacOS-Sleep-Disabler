@@ -3,6 +3,17 @@ implement plan:
 /goal go into ./linux/gnome-wayland/, read the current code, read git commit history. then go into planning/ and read plan0.6.md, implement it FULLY. double check you've fully implemented it, double check again. you should clear the contents of task.md and create subtasks in very detailed form before you start to keep yourself on track (mark each subtask done after completion and 2 pass double checks), and do not clear the task.md after you are completely finished with the goal.
 after that do another full logical check without code execution for the gnome wayland version, complete stack check from the very top. to ensure no more logical bugs are present. then finish goal. do not try to test it out yet (test the sleep functionality or any scheduling). you are only allowed to probe available api endpoints but do NOT try to sleep my laptop.
 
+/goal go into ./linux/gnome-wayland/, read the current code, read git commit history. then go into planning/ and read plan0.7.md, implement it FULLY. double check you've fully implemented it, double
+check again. you should clear the contents of task.md and create subtasks in very detailed form before you start to keep yourself on track (mark each subtask done after completion and 2 pass double checks),
+and do not clear the task.md after you are completely finished with the goal.
+after that do another full logical check without code execution for the gnome wayland version, complete stack check from the very top. to ensure no more logical bugs are present. then finish goal. do not
+try to test it out yet (test the sleep functionality or any scheduling). you are only allowed to probe available api endpoints but do NOT try to sleep my laptop. make sure plan 0.6 and 0.7 is both fully
+implemented and all new bugs found are also fully fixed and implemented and the mark the goal as achieved. if you are stuck at something try to solve it yourself first (without sleeping the laptop) if you
+still can't then mark the goal as blocked and throw the question at me. be aware that most non-mac laptops' BIOS will automatically make the screen go off when lid closed no matter what OS level or kernel
+level setting we use, so the lid dimmer function may not be a hard requirement. by setting the lidswitch=ignore (i think its in logind but im not sure), the wayland display server on kali-wayland still
+renders on the gpu level with the lid closed and screen off by BIOS, but its very glitchy and not rendering the full screen correctly but framerate still 60. might want to further research into that
+behaviour.
+
 
 write plan:
 
