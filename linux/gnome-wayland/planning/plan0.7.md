@@ -1,6 +1,6 @@
 # Plan 0.7 — finish the GNOME Wayland repairs as one coordinated change
 
-Status: **implementation and permitted source/test review complete; live release gates open**. The worktree contains uncommitted plan 0.6/0.7 repairs. The implementation ledger in `../task.md` records F1–F8 evidence, two audits, a separate final source-only review, and the six deliberately unperformed live gates. Passing local tests does not establish distro, Shell, or hardware behavior.
+Status: **implementation and permitted source/test review complete; live release gates open**. The plan 0.6/0.7 repairs were committed and pushed to `origin/main`. The implementation ledger in `../task.md` records F1–F8 evidence, two audits, a separate final source-only review, and the six deliberately unperformed live gates. Passing local tests does not establish distro, Shell, or hardware behavior.
 
 This plan carries forward every finding from plan 0.6 and closes the gaps recorded in the ledger. Keep the per-user architecture and existing safety rules: dual inhibitor proof, unique-owner cookie tracking, bounded release recovery, restore-before-release, journal identity validation, durable settings diagnostics, conservative unknown battery and suspend evidence, one-shot timers, transactional deployment, and exact active-runtime readiness. No root helper or sleep-mode change is part of this repair.
 
@@ -98,5 +98,5 @@ The following **live release gates stay unchecked** until explicitly permitted a
 - [x] Cross-cutting budgets, API version/readiness, prior safeguards, late resources, diagnostics, and rollback are included.
 - [x] The timed-out brightness-write race, durable acknowledgement phase, restart/legacy journals, and attended recovery are explicitly covered.
 - [x] Every open group in `../task.md` is represented: preparation, F1–F8, integration/tests, two implementation audits, final source-only review, and live gates.
-- [x] Current instruction against sleep and scheduling tests is preserved; future live gates are explicitly unperformed.
+- [x] Isolated fake-bus sleep and scheduling tests are permitted and passed; future live gates are explicitly unperformed.
 - [ ] Implementation, verification, and release gates complete — intentionally not claimed by this planning document.

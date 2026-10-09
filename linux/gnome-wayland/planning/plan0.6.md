@@ -1,6 +1,6 @@
 # Plan 0.6 — GNOME Wayland responsiveness and remaining logical repairs
 
-Status: **planning complete; implementation and verification not started**.
+Status: **implementation and permitted verification complete; live release gates open**. Plans 0.7 and 0.8, together with `../task.md`, record the implementation, two audits, isolated fake-service results, and remaining attended target-session checks.
 
 This plan follows the source-only review after plan 0.5. It covers all eight findings in that review. Implement it as one coordinated change across the agent, extension, installer, service contract, CLI, tests, and documentation. Retain the existing per-user architecture: no root helper, new privileged service, or kernel sleep-state change.
 
@@ -312,7 +312,7 @@ Completion requires all eight repairs and both audits, sufficient deterministic 
 
 - [x] Document pass 1: all eight review findings have their own repair section and required failure-case evidence; the coverage table maps every finding.
 - [x] Document pass 2: reviewed cross-component effects on service budgets, asynchronous API/client deadlines, late resources, clocks, journal recovery, XDG discovery/rollback, runtime proof, error lifetimes, versioning, prior safeguards, and `deep`/`s2idle` gates.
-- [ ] Implementation complete.
-- [ ] Implementation audit pass 1 complete.
-- [ ] Implementation audit pass 2 complete.
+- [x] Implementation complete; see the F1–F8 source and evidence ledger in `../task.md`.
+- [x] Implementation audit pass 1 complete; requirement-to-source evidence is recorded in `../task.md`.
+- [x] Implementation audit pass 2 complete; adversarial stack and separate final source-only reviews are recorded in `../task.md`.
 - [ ] Live release gates complete.
