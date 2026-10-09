@@ -2,7 +2,7 @@
 
 Status: **fake-service implementation and isolated verification complete; delivery and live gates remain open**. Commit `422e07b` records the 0.6/0.7 work. The pre-0.8 full run found 53 assertion failures and seven errors in 206 agent cases. After callback-fixture migration and two final fixture corrections, the isolated fake-bus agent suite passed all 212 current cases on 2026-10-09. That proves current fake-path assertions, not live GNOME or hardware behavior. The current core installer suite passed 84 cases with one skip, CLI passed five, and the GJS panel harness passed. The shell installer suite exceeded a 240-second serial limit, then all 44 cases passed when partitioned into four independent 11-case temporary-home shards; no single serial run is claimed.
 
-The user now permits **isolated fake-bus sleep and scheduling tests that cannot suspend the laptop**. The agent test module installs fake `dbus` and GLib modules before importing production code; it has no live bus constructor, and `Suspend` is a mock. Do not invoke a live `Suspend`, `systemctl suspend`, timer, or lid-close path. A separate source-only final walkthrough is required after implementation. The user chose to leave commits local for now, so the remote push is deferred.
+The user now permits **isolated fake-bus sleep and scheduling tests that cannot suspend the laptop**. The agent test module installs fake `dbus` and GLib modules before importing production code; it has no live bus constructor, and `Suspend` is a mock. Do not invoke a live `Suspend`, `systemctl suspend`, timer, or lid-close path. A separate source-only final walkthrough is required after implementation. The user chose to leave commits local for now, so the remote push is deferred. The remote now uses SSH, and a read-only connection check succeeded with the existing key; no push has been attempted through SSH.
 
 ## 1. Required result and evidence rules
 
@@ -65,6 +65,6 @@ Any discovered defect gets a minimal production repair, corresponding regression
 - [x] Plans 0.6 and 0.7 rechecked requirement by requirement against final source.
 - [x] Permitted isolated verification passes; fake sleep/scheduling coverage and all live gates are honestly distinguished.
 - [x] Full source-only stack review found no remaining concrete logical defect; live proof remains open.
-- [ ] Requested commit is pushed to the configured remote after authentication is available; Git state proves it.
+- [ ] Requested commits are pushed to the configured SSH remote after the user lifts the local-only preference; Git state proves it.
 
 Source context: [systemd login1 D-Bus API](https://www.freedesktop.org/software/systemd/man/latest/org.freedesktop.login1.html), [logind lid configuration](https://www.freedesktop.org/software/systemd/man/latest/logind.conf.html), [systemd inhibitor locks](https://github.com/systemd/systemd/blob/main/docs/INHIBITOR_LOCKS.md), and [Mutter overview](https://gnome.pages.gitlab.gnome.org/mutter/).
