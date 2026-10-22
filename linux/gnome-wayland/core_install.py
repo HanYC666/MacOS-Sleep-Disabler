@@ -457,19 +457,21 @@ def service_snapshot(unit, artifacts=()):
     enabled = systemctl('is-enabled', SERVICE)
     active = systemctl('is-active', SERVICE)
     enable_text, active_text = enabled.stdout.strip(), active.stdout.strip()
+    missing = (enable_text == 'not-found' and enabled.returncode in (1, 4) and
+               not any(path.exists() or path.is_symlink() for path in (unit, *artifacts)))
     if enable_text == 'enabled' and enabled.returncode == 0:
         was_enabled = True
     elif enable_text == 'disabled' and enabled.returncode == 1:
         was_enabled = False
-    elif (enable_text == 'not-found' and enabled.returncode in (1, 4)
-          and not any(path.exists() or path.is_symlink() for path in (unit, *artifacts))):
+    elif missing:
         was_enabled = False
     else:
         raise ValueError('prior service enablement cannot be restored safely: ' +
                          (enable_text or enabled.stderr.strip() or 'unknown'))
     if active_text == 'active' and active.returncode == 0:
         was_active = True
-    elif active_text == 'inactive' and active.returncode == 3:
+    elif active_text == 'inactive' and (active.returncode == 3 or
+                                       missing and active.returncode == 4):
         was_active = False
     else:
         raise ValueError('prior service running state cannot be restored safely: ' +
@@ -596,7 +598,8 @@ class CoreTransaction:
         for target in (self.program, self.cli, self.unit):
             target.parent.mkdir(parents=True, exist_ok=True)
         stage = Path(tempfile.mkdtemp(prefix='.sleep-disabler-core-stage.', dir=self.program.parent))
-        for name in ('agent.py', 'ctl.py'):
+        for name in ('agent.py', 'ctl.py', 'key_guard.py', 'guard_status.py',
+                     'sleep_guard.py', 'system_guard_install.py'):
             shutil.copyfile(self.source / name, stage / name)
             (stage / name).chmod(0o644)
         (stage / 'agent-launcher').write_text(launcher(self.python, self.program / 'agent.py'))
@@ -617,7 +620,10 @@ class CoreTransaction:
         # Compile staging sources without importing/starting the agent.
         compile_script = 'import pathlib,sys; [compile(pathlib.Path(p).read_text(),p,"exec") for p in sys.argv[1:]]'
         for command in ([self.python, '-c', 'import dbus, gi'],
-                        [self.python, '-c', compile_script, str(stage / 'agent.py'), str(stage / 'ctl.py')],
+                        [self.python, '-c', compile_script, str(stage / 'agent.py'),
+                         str(stage / 'ctl.py'), str(stage / 'key_guard.py'),
+                         str(stage / 'guard_status.py'), str(stage / 'sleep_guard.py'),
+                         str(stage / 'system_guard_install.py')],
                         ['sh', '-n', str(stage / 'agent-launcher')], ['sh', '-n', str(cli_stage)]):
             result = run(command)
             if result.returncode:

@@ -1,5 +1,20 @@
 # GNOME Wayland plan 0.8 implementation ledger
 
+## Subsequent plan 0.9 result (2026-10-19)
+
+[Plan 0.9](planning/plan0.9.md) records the newer manual-sleep prevention and
+inclusive battery boundary changes. Agent 0.7.0 / API 6 and panel 7 were cleanly
+reinstalled with preferences/recovery data preserved; the authenticated system
+guard was installed for all four sleep services. After the user's fresh login,
+panel 7 is ACTIVE and registered, prevention and hardware-key redirection are on,
+the strong login1/GNOME inhibitors are held, and systemGuardState is verified.
+Direct read-only helper checks returned allow when off and skip when on. The
+installed user unit passed systemd-analyze verification. Timer and failsafe are
+off; no live sleep request was sent. The failsafe now triggers at <= and rearms
+above the threshold. Lid stay-awake remains experimental, and physical sleep
+behavior still requires an attended test. The older ledger below is historical;
+plan 0.9 contains the current test counts, deployment evidence, and limitations.
+
 This ledger replaces the previous 0.6/0.7 ledger as requested. The previous evidence remains in commit `422e07b`; its conclusions must be rechecked against current source. Keep this file after completion. Mark a task complete only after implementation or proof, permitted verification, and two separate review passes. `plan0.8.md` governs the work. The user now permits isolated fake-bus sleep and scheduling tests that cannot suspend the laptop; no live sleep, timer, or lid-close behavior may be tested.
 
 ## Delivery and baseline

@@ -90,20 +90,20 @@ for node in ast.parse(program.read_text()).body:
             if isinstance(target, ast.Name) and target.id in ('AGENT_RUNTIME_VERSION', 'API_VERSION'):
                 constants[target.id] = ast.literal_eval(node.value)
 version = constants['AGENT_RUNTIME_VERSION']
-if version == '0.6.0':
+if version == '0.7.0':
     counter = home / '.core-api-count'
     count = int(counter.read_text()) + 1 if counter.exists() else 1
     counter.write_text(str(count))
     if os.environ.get('CORE_API_FAIL') == '1' or count <= int(os.environ.get('CORE_API_DELAY', '0')): sys.exit(1)
     if os.environ.get('STALE_AGENT') == '1': version = '0.4.0'
 api = constants['API_VERSION']
-if version == '0.6.0' and os.environ.get('BAD_API') == '1': api = 999
+if version == '0.7.0' and os.environ.get('BAD_API') == '1': api = 999
 panel = '1' if os.environ.get('PREV_ACTIVE') == '1' else ''
 target = Path(os.environ['XDG_DATA_HOME']) / 'gnome-shell/extensions/sleep-disabler@local'
 if (home / '.gnome-test-enabled').exists():
-    panel = '6' if (target / 'extension.js').exists() else '1'
-    if panel == '6' and 'PANEL_RUNTIME' in os.environ: panel = os.environ['PANEL_RUNTIME']
-    if panel == '6':
+    panel = '7' if (target / 'extension.js').exists() else '1'
+    if panel == '7' and 'PANEL_RUNTIME' in os.environ: panel = os.environ['PANEL_RUNTIME']
+    if panel == '7':
         counter = home / '.panel-api-count'
         count = int(counter.read_text()) + 1 if counter.exists() else 1
         counter.write_text(str(count))

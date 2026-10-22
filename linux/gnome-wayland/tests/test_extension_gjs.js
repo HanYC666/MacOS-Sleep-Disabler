@@ -74,10 +74,12 @@ const PanelMenu = {Button: class {
 const PopupMenu = {PopupMenuItem: Item, PopupSwitchMenuItem: Item,
     PopupSeparatorMenuItem: class {}};
 const St = {Icon: class {}};
-const Main = {panel: {addToStatusArea() {}}};
+const Main = {panel: {addToStatusArea() {}}, screenShield: {lock() {}}};
+const systemActions = {activateSuspend() {}};
+const SystemActions = {getDefault: () => systemActions};
 const ExtensionClass = new Function('Gio', 'GLib', 'St', 'Extension', 'Main',
-    'PanelMenu', 'PopupMenu', `${source}\nreturn SleepDisablerExtension;`)(
-        GioFake, GLibFake, St, class {}, Main, PanelMenu, PopupMenu);
+    'PanelMenu', 'PopupMenu', 'SystemActions', `${source}\nreturn SleepDisablerExtension;`)(
+        GioFake, GLibFake, St, class {}, Main, PanelMenu, PopupMenu, SystemActions);
 
 const calls = [];
 const signals = new Map();
@@ -106,7 +108,7 @@ panel._connected(bus, ':1.agent');
 check(calls.length === 2, 'connection requests state and registration');
 check(calls[0][7] === 3000, 'status call uses the three-second bound');
 check(calls[1][3] === 'RegisterPanelRuntime', 'runtime registration method');
-check(calls[1][4].deep_unpack()[0] === '6', 'current runtime version');
+check(calls[1][4].deep_unpack()[0] === '7', 'current runtime version');
 
 const state = {enabled: true, desired: true, timerRemaining: 0};
 calls[0][9](bus, {deep_unpack: () => [state]});
@@ -286,7 +288,7 @@ newOwnerRegistration[9](bus, {error: 'remote success followed by timeout'});
 fireTimer(changedDuringRetry._registrationRetry);
 const repeatedRegistration = calls.at(-1);
 check(repeatedRegistration[0] === ':1.after' &&
-    repeatedRegistration[4].deep_unpack()[0] === '6',
+    repeatedRegistration[4].deep_unpack()[0] === '7',
     'timeout retry repeats registration for the same owner and version');
 repeatedRegistration[9](bus, {});
 check(changedDuringRetry._registrationState === 'succeeded',
@@ -316,3 +318,37 @@ reenabled.disable();
 }
 
 print('GJS panel callback, lifecycle, and error harness passed');
+
+// Exercise the actual hook with fake Shell actions, never a real sleep request.
+let lockCalls = 0;
+let originalCalls = 0;
+Main.screenShield.lock = value => {
+    check(value === true, 'sleep action requests immediate screen lock');
+    lockCalls++;
+};
+const originalSuspend = () => { originalCalls++; };
+systemActions.activateSuspend = originalSuspend;
+const guardPanel = new ExtensionClass();
+guardPanel.enable();
+guardPanel._syncSuspendGuard(true);
+systemActions.activateSuspend();
+check(lockCalls === 1 && originalCalls === 0, 'prevention redirects suspend to lock');
+guardPanel._syncSuspendGuard(true);
+guardPanel._syncSuspendGuard(false);
+check(systemActions.activateSuspend === originalSuspend, 'off restores original suspend action');
+guardPanel._syncSuspendGuard(true);
+guardPanel._connected(bus, ':1.guard-replacement');
+check(systemActions.activateSuspend === originalSuspend, 'new agent owner clears old hook');
+guardPanel._syncSuspendGuard(true);
+guardPanel._disconnected();
+check(systemActions.activateSuspend === originalSuspend, 'disconnect restores original action');
+guardPanel._syncSuspendGuard(true);
+const otherExtension = () => {};
+systemActions.activateSuspend = otherExtension;
+guardPanel._syncSuspendGuard(false);
+check(systemActions.activateSuspend === otherExtension, 'cleanup preserves a later extension override');
+systemActions.activateSuspend = originalSuspend;
+guardPanel._syncSuspendGuard(true);
+guardPanel.disable();
+check(systemActions.activateSuspend === originalSuspend, 'disable restores original action');
+print('GJS suspend-to-lock hook lifecycle checks passed');

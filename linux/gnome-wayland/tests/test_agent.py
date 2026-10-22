@@ -73,6 +73,7 @@ sys.modules.update({
     "dbus.mainloop": dbus.mainloop, "dbus.mainloop.glib": dbus.mainloop.glib,
     "gi": gi, "gi.repository": gi.repository,
 })
+sys.path.insert(0, str(Path(__file__).parents[1]))
 spec = importlib.util.spec_from_file_location(
     "sleep_disabler_agent", Path(__file__).parents[1] / "agent.py")
 agent_module = importlib.util.module_from_spec(spec)
@@ -569,6 +570,7 @@ class AgentTests(unittest.TestCase):
                 mock.patch.object(agent_module, 'data_home', return_value=Path(self.directory.name)), \
                 mock.patch.object(agent_module.Agent, 'load_settings', side_effect=lambda: events.append(('settings', 'loaded'))), \
                 mock.patch.object(agent_module.Agent, 'refresh_brightness_capability'), \
+                mock.patch.object(agent_module.Agent, 'refresh_system_guard'), \
                 mock.patch.object(agent_module.Agent, 'refresh_power_async'), \
                 mock.patch.object(agent_module.Agent, 'reconcile_brightness'):
             agent_module.Agent()
@@ -715,6 +717,16 @@ class AgentTests(unittest.TestCase):
         self.agent = a
         a.brightness_path = Path(self.directory.name) / "recovery.json"
         a.settings_path = Path(self.directory.name) / "preferences.json"
+        a.key_guard = mock.Mock()
+        a.key_guard.active.return_value = True
+        a.key_guard.journal_missing.return_value = False
+        a.key_journal_missing_notified = False
+        a.key_guard_error = ''
+        a.system_guard_state = 'verified'
+        a.system_guard_error = ''
+        a.system_guard_pending = False
+        a.system_guard_checked = agent_module.time.monotonic()
+        a.refresh_system_guard = mock.Mock()
         a.brightness_record = None
         a.brightness_error = ""
         a.brightness_journal_state = 'absent'
@@ -1191,6 +1203,85 @@ class AgentTests(unittest.TestCase):
         self.assertEqual(len(fake_glib.sources), 1)
         names.GetNameOwner.assert_called_once()
         gnome.Uninhibit.assert_called_once()
+
+    def test_sync_release_restores_keys_even_when_gnome_release_raises(self):
+        self.held_cookie()
+        self.agent.attempt_session_release = mock.Mock(side_effect=FakeDBusException('timeout'))
+        self.agent.release(brightness_reconciled=True)
+        self.agent.key_guard.restore.assert_called_once_with()
+        self.assertFalse(self.agent.enabled)
+
+    def test_failed_key_redirection_cleans_known_cookie_and_fd(self):
+        a = self.agent
+        a.desired = True
+        a.key_guard.acquire.side_effect = ValueError('key mapping failed')
+        results = []
+        names = types.SimpleNamespace(GetNameOwner=mock.Mock(side_effect=lambda name, **kwargs:
+            kwargs['reply_handler'](':1.login' if name == agent_module.LOGIN else ':1.gnome')))
+        login = types.SimpleNamespace(Inhibit=mock.Mock(side_effect=lambda *_args, **kwargs:
+            kwargs['reply_handler'](types.SimpleNamespace(take=lambda: 42))))
+        gnome = types.SimpleNamespace(
+            Inhibit=mock.Mock(side_effect=lambda *_args, **kwargs:
+                kwargs['reply_handler'](agent_module.dbus.UInt32(7))),
+            Uninhibit=mock.Mock(side_effect=lambda *_args, **kwargs: kwargs['reply_handler']()))
+        a.proxy = mock.Mock(side_effect=lambda _bus, name, _path, _interface:
+            names if name == 'org.freedesktop.DBus' else login if name == ':1.login' else gnome)
+        a.session_bus = types.SimpleNamespace(get_is_connected=lambda: True, close=mock.Mock())
+        with mock.patch.object(agent_module.os, 'close') as close:
+            a.acquire_async(results.append)
+        close.assert_called_once_with(42)
+        gnome.Uninhibit.assert_called_once()
+        a.key_guard.restore.assert_called_once()
+        self.assertFalse(a.enabled)
+        self.assertEqual(a.session_cookie_state, 'absent')
+        self.assertEqual(len(results), 1)
+        self.assertIn('key mapping failed', str(results[0]))
+
+    def test_guard_readback_is_coalesced_and_applied_on_main_loop(self):
+        a = self.agent
+        a.system_guard_state = 'checking'
+        a.publish = mock.Mock()
+        with mock.patch.object(agent_module.threading, 'Thread') as thread, \
+                mock.patch.object(agent_module, 'inspect_guard', return_value=('verified', '')):
+            agent_module.Agent.refresh_system_guard(a)
+            agent_module.Agent.refresh_system_guard(a)
+            thread.assert_called_once()
+            thread.call_args.kwargs['target']()
+        self.assertEqual(a.system_guard_state, 'checking')
+        callback, state, error = fake_glib.idle_add.call_args.args
+        callback(state, error)
+        self.assertEqual(a.system_guard_state, 'verified')
+        self.assertFalse(a.system_guard_pending)
+        a.publish.assert_called_once()
+
+    def test_key_restoration_failure_does_not_report_successful_release(self):
+        self.held_cookie()
+        self.agent.attempt_session_release = mock.Mock(return_value=True)
+        self.agent.key_guard.restore.side_effect = OSError('settings unavailable')
+        self.assertFalse(self.agent.release(brightness_reconciled=True))
+        self.assertIn('restoration pending', self.agent.last_error)
+
+    def test_missing_key_journal_notifies_once_without_releasing_prevention(self):
+        a = self.agent
+        a.enabled = a.desired = True
+        a.key_guard.journal_missing.return_value = True
+        a.release_async = mock.Mock()
+        a.reconcile_sleep_state = mock.Mock()
+        a.reconcile_brightness_async = mock.Mock()
+        a.retry_session_release = mock.Mock()
+        for _ in range(3):
+            a.reconcile()
+        self.assertTrue(a.enabled)
+        self.assertTrue(a.desired)
+        a.release_async.assert_not_called()
+        a.key_guard.restore.assert_not_called()
+        a.notify.assert_called_once()
+        self.assertIn('remains on', a.notify.call_args.args[1])
+        a.key_guard.journal_missing.return_value = False
+        a.reconcile()
+        a.key_guard.journal_missing.return_value = True
+        a.reconcile()
+        self.assertEqual(a.notify.call_count, 2)
 
     def test_release_retry_success_cancels_pending_state(self):
         self.held_cookie()
@@ -1875,7 +1966,7 @@ class AgentTests(unittest.TestCase):
         changes = (('on_battery', False), ('on_battery', None),
                    ('battery_discharge_state', 'unknown'),
                    ('battery_discharge_state', 'not-discharging'),
-                   ('battery_percent', None), ('battery_percent', 20),
+                   ('battery_percent', None), ('battery_percent', 20.1),
                    ('failsafe', False))
         for attr, value in changes:
             with self.subTest(attr=attr, value=value):
@@ -1899,6 +1990,7 @@ class AgentTests(unittest.TestCase):
 
     def test_failsafe_stable_power_dispatches_once_after_effective_release(self):
         self.configure_low_battery()
+        self.agent.battery_percent = self.agent.threshold
         self.allow_async_sleep_steps()
         def release(callback, **_kwargs):
             self.agent.enabled = False
@@ -2143,9 +2235,49 @@ class AgentTests(unittest.TestCase):
                 self.agent.check_failsafe()
                 self.agent.sleep_now.assert_called_once()
 
+    def test_failsafe_includes_threshold_and_does_not_rearm_at_equality(self):
+        self.agent.enabled = True
+        self.agent.failsafe = True
+        self.agent.on_battery = True
+        self.agent.battery_discharge_state = 'discharging'
+        self.agent.battery_percent = self.agent.threshold
+        self.agent.sleep_now = mock.Mock()
+        self.agent.check_failsafe = agent_module.Agent.check_failsafe.__get__(self.agent)
+        self.agent.suspend_preflight_async = mock.Mock(
+            side_effect=lambda callback, **_kwargs: callback(True, '', ':1.login'))
+
+        self.agent.check_failsafe()
+        self.agent.sleep_now.assert_called_once_with(
+            'Battery reached or fell below the failsafe threshold')
+        self.assertTrue(self.agent.failsafe_triggered)
+        for percentage in (20, 19, 20):
+            self.agent.battery_percent = percentage
+            self.agent.check_failsafe()
+        self.agent.sleep_now.assert_called_once()
+
+        self.agent.battery_percent = 20.1
+        self.agent.check_failsafe()
+        self.assertFalse(self.agent.failsafe_triggered)
+        self.agent.battery_percent = 20
+        self.agent.check_failsafe()
+        self.assertEqual(self.agent.sleep_now.call_count, 2)
+
+    def test_failsafe_boundary_predicates(self):
+        self.agent.enabled = True
+        self.agent.failsafe = True
+        self.agent.on_battery = True
+        self.agent.battery_discharge_state = 'discharging'
+        for percentage, met, cleared in (
+                (None, False, False), (19.9, True, False),
+                (20, True, False), (20.1, False, True)):
+            with self.subTest(percentage=percentage):
+                self.agent.battery_percent = percentage
+                self.assertEqual(self.agent.failsafe_condition_met(), met)
+                self.assertEqual(self.agent.failsafe_condition_cleared(), cleared)
+
     def test_positive_recovery_rearms_failsafe_episode(self):
         for on_battery, percentage, discharge in (
-                (False, None, 'unknown'), (True, 20, 'unknown'),
+                (False, None, 'unknown'), (True, 21, 'unknown'),
                 (True, 5, 'not-discharging')):
             self.agent.failsafe = True
             self.agent.failsafe_triggered = True
@@ -2214,7 +2346,7 @@ class AgentTests(unittest.TestCase):
         register('5')
         self.agent.UnregisterPanelRuntime('5', sender=':1.42')
         self.assertFalse(self.agent.state()['panelRuntimeRegistered'])
-        self.assertEqual(self.agent.state()['agentRuntimeVersion'], '0.6.0')
+        self.assertEqual(self.agent.state()['agentRuntimeVersion'], '0.7.0')
         self.assertEqual(self.agent.state()['apiVersion'], 6)
 
     def test_panel_registration_rejects_non_shell_and_stale_owner_replies(self):

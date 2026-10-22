@@ -59,6 +59,9 @@ context.PopupMenu = {PopupMenuItem: MenuItem, PopupSwitchMenuItem: MenuItem,
     PopupSeparatorMenuItem: class {}};
 context.St = {Icon: class {}};
 context.Main = {panel: {addToStatusArea() {}}};
+context.Main.screenShield = {lock() {}};
+const systemActions = {activateSuspend() {}};
+context.SystemActions = {getDefault: () => systemActions};
 function makePanel() {
     const panel = new context.SleepDisablerExtension();
     panel._button = {destroy() {}};
@@ -122,7 +125,7 @@ assert.equal(panel._prevention.sensitive, false);
 assert.equal(panel._status.label.text, 'Connecting…');
 assert.equal(calls.length, 2, 'connecting requests state and registers the runtime');
 assert.equal(calls[1][3], 'RegisterPanelRuntime');
-assert.equal(calls[1][4].deep_unpack()[0], '6');
+assert.equal(calls[1][4].deep_unpack()[0], '7');
 
 // A current-generation StateChanged may establish connection before GetState.
 const stateSubscription = subscriptions.find(entry => entry.signal === 'StateChanged');

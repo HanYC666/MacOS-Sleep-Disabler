@@ -6,11 +6,12 @@ import {Extension} from 'resource:///org/gnome/shell/extensions/extension.js';
 import * as Main from 'resource:///org/gnome/shell/ui/main.js';
 import * as PanelMenu from 'resource:///org/gnome/shell/ui/panelMenu.js';
 import * as PopupMenu from 'resource:///org/gnome/shell/ui/popupMenu.js';
+import * as SystemActions from 'resource:///org/gnome/shell/misc/systemActions.js';
 
 const APP = 'org.sleepdisabler.App';
 const PATH = '/org/sleepdisabler/App';
 const IFACE = 'org.sleepdisabler.App1';
-const PANEL_RUNTIME_VERSION = '6';
+const PANEL_RUNTIME_VERSION = '7';
 const STATE_ATTEMPTS = 3;
 const STATE_RETRY_DELAYS = [1, 2];
 const REGISTRATION_ATTEMPTS = 3;
@@ -117,6 +118,7 @@ export default class SleepDisablerExtension extends Extension {
     _connected(connection, owner = APP) {
         if (!this._button)
             return;
+        this._syncSuspendGuard(false);
         this._generation++;
         this._cancellable?.cancel();
         this._cancellable = new Gio.Cancellable();
@@ -321,6 +323,7 @@ export default class SleepDisablerExtension extends Extension {
     }
 
     _disconnected() {
+        this._syncSuspendGuard(false);
         this._generation++;
         this._cancellable?.cancel();
         this._cancelStateRetry();
@@ -357,6 +360,22 @@ export default class SleepDisablerExtension extends Extension {
             'weather-clear-night-symbolic' : 'dialog-warning-symbolic';
     }
 
+    _syncSuspendGuard(on) {
+        if (on && !this._suspendGuard) {
+            this._systemActions = SystemActions.getDefault();
+            this._previousSuspend = this._systemActions.activateSuspend;
+            this._suspendGuard = () => Main.screenShield.lock(true);
+            this._systemActions.activateSuspend = this._suspendGuard;
+        } else if (!on && this._suspendGuard) {
+            // Preserve an override installed by another extension after ours.
+            if (this._systemActions.activateSuspend === this._suspendGuard)
+                this._systemActions.activateSuspend = this._previousSuspend;
+            this._suspendGuard = null;
+            this._previousSuspend = null;
+            this._systemActions = null;
+        }
+    }
+
     _render(state) {
         if (!this._button)
             return;
@@ -364,6 +383,7 @@ export default class SleepDisablerExtension extends Extension {
             return;
         this._state = state;
         const on = Boolean(value(state, 'enabled', false));
+        this._syncSuspendGuard(on);
         const desired = Boolean(value(state, 'desired', false));
         const releasePending = Boolean(value(state, 'gnomeReleasePending', false));
         const error = String(value(state, 'error', ''));
@@ -371,6 +391,11 @@ export default class SleepDisablerExtension extends Extension {
         const battery = Number(value(state, 'batteryPercent', -1));
         const parts = [releasePending ? 'Prevention release pending' :
             on ? 'Prevention on' : desired ? 'Reconnecting…' : 'Prevention off'];
+        if (on && String(value(state, 'systemGuardState', 'unavailable')) !== 'verified')
+            parts.push('Manual sleep guard unverified');
+        const guardError = String(value(state, 'systemGuardError', ''));
+        if (on && guardError)
+            parts.push(guardError);
         if (remaining > 0)
             parts.push(`sleep in ${Math.ceil(remaining / 60)} min`);
         if (battery >= 0)
@@ -468,6 +493,7 @@ export default class SleepDisablerExtension extends Extension {
     }
 
     disable() {
+        this._syncSuspendGuard(false);
         this._watchGeneration = (this._watchGeneration ?? 0) + 1;
         if (this._bus && this._owner && this._registrationAttempts > 0) {
             try {

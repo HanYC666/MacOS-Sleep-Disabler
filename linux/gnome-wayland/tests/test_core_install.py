@@ -780,6 +780,8 @@ class CoreTests(unittest.TestCase):
             with mock.patch.object(core, 'systemctl', side_effect=answers):
                 return core.service_snapshot(unit, (program, cli))
         self.assertEqual(snapshot(), (False, False))
+        answers[1] = subprocess.CompletedProcess([], 4, 'inactive\n', '')
+        self.assertEqual(snapshot(), (False, False))
         program.mkdir()
         with self.assertRaisesRegex(ValueError, 'enablement cannot be restored'):
             snapshot()
@@ -798,6 +800,15 @@ class CoreTests(unittest.TestCase):
         with self.patches():
             with self.assertRaisesRegex(ValueError, 'target ordering'):
                 self.transaction.install()
+
+    def test_inactive_exit_four_is_rejected_for_an_existing_unit(self):
+        unit = self.root / 'existing.service'
+        unit.write_text('[Service]\n')
+        answers = [subprocess.CompletedProcess([], 1, 'disabled\n', ''),
+                   subprocess.CompletedProcess([], 4, 'inactive\n', '')]
+        with mock.patch.object(core, 'systemctl', side_effect=answers):
+            with self.assertRaisesRegex(ValueError, 'running state'):
+                core.service_snapshot(unit)
         self.assert_old_restored()
         self.assertFalse(self.transaction.record.exists())
 
@@ -873,6 +884,9 @@ class CoreTests(unittest.TestCase):
         self.source.mkdir()
         (self.source / 'agent.py').write_text('AGENT_RUNTIME_VERSION = "0.6.0"\nAPI_VERSION = 6\n')
         (self.source / 'ctl.py').write_text('print("new cli")\n')
+        (self.source / 'key_guard.py').write_text('# fake key guard\n')
+        for name in ('guard_status.py', 'sleep_guard.py', 'system_guard_install.py'):
+            (self.source / name).write_text('# fake guard component\n')
         (self.source / core.SERVICE).write_text((SOURCE / core.SERVICE).read_text())
         environment = mock.patch.dict(os.environ, {'HOME': str(self.home),
                                                     'XDG_CONFIG_HOME': str(self.root / 'config')})

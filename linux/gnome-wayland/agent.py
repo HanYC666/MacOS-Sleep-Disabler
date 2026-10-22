@@ -1,5 +1,5 @@
 #!/usr/bin/python3
-"""Per-user GNOME Wayland prototype. No privileged helper or global setting edits."""
+"""Per-user GNOME Wayland agent with reversible keys and a system sleep guard."""
 
 import json
 import logging
@@ -10,12 +10,15 @@ from pathlib import Path
 import re
 import signal
 import time
+import threading
 import xml.etree.ElementTree as ET
 
 import dbus
 import dbus.mainloop.glib
 import dbus.service
 from gi.repository import GLib
+from key_guard import GnomeKeyGuard
+from guard_status import inspect_guard
 
 
 APP = "org.sleepdisabler.App"
@@ -61,7 +64,7 @@ DEFINITE_SUSPEND_REJECTIONS = frozenset((
     'org.freedesktop.login1.OperationInProgress',
 ))
 LOG = logging.getLogger("sleep-disabler")
-AGENT_RUNTIME_VERSION = "0.6.0"
+AGENT_RUNTIME_VERSION = "0.7.0"
 API_VERSION = 6
 PANEL_VERSION_RE = re.compile(r"^[1-9][0-9]*(?:\.[0-9]+){0,2}$")
 
@@ -361,6 +364,18 @@ class Agent(dbus.service.Object):
         self.dimming_disable_requests = set()
         self.last_timer_state = -1
         self.settings_path = data_home() / "preferences.json"
+        self.key_guard = None
+        self.key_guard_error = ''
+        self.key_journal_missing_notified = False
+        self.system_guard_state = 'checking'
+        self.system_guard_error = ''
+        self.system_guard_pending = False
+        self.system_guard_checked = 0.0
+        try:
+            self.key_guard = GnomeKeyGuard(data_home() / 'sleep-key-recovery.json', atomic_json)
+            self.key_guard.restore()
+        except Exception as error:
+            self.key_guard_error = 'Sleep-key recovery unavailable: ' + str(error)
         self.brightness_path = data_home() / "brightness-recovery.json"
         self.watch_bus_disconnects()
         self.check_startup_connections()
@@ -403,6 +418,7 @@ class Agent(dbus.service.Object):
             if not reconcile_source:
                 raise RuntimeError('GLib did not attach periodic reconciliation')
             self.refresh_brightness_capability('startup')
+            self.refresh_system_guard()
             self.refresh_power_async()
             self.reconcile_brightness_async('startup')
         except Exception:
@@ -1788,6 +1804,60 @@ class Agent(dbus.service.Object):
         elif self.lid_closed is True:
             self.reconcile_brightness_async('lid-close')
 
+    def refresh_system_guard(self):
+        if self.system_guard_pending or self.shutting_down:
+            return
+        self.system_guard_pending = True
+
+        def completed(state, error):
+            self.system_guard_pending = False
+            if not self.shutting_down:
+                self.system_guard_state = state
+                self.system_guard_error = error
+                self.system_guard_checked = time.monotonic()
+                self.publish()
+            return False
+
+        def check():
+            state, error = inspect_guard()
+            GLib.idle_add(completed, state, error)
+
+        try:
+            threading.Thread(target=check, daemon=True,
+                             name='sleep-guard-readback').start()
+        except Exception as error:
+            completed('unavailable', str(error))
+
+    def acquire_key_guard(self):
+        if self.key_guard is None:
+            raise ValueError(self.key_guard_error or 'GNOME sleep-key guard unavailable')
+        try:
+            self.key_guard.acquire()
+            self.key_guard_error = ''
+        except Exception as error:
+            self.key_guard_error = 'Sleep-key redirection failed: ' + str(error)
+            raise
+
+    def restore_key_guard(self):
+        if self.key_guard is None:
+            return not self.key_guard_error
+        try:
+            self.key_guard.restore()
+            self.key_guard_error = ''
+            self.key_journal_missing_notified = False
+            return True
+        except Exception as error:
+            self.key_guard_error = 'Sleep-key restoration pending: ' + str(error)
+            LOG.error('%s', self.key_guard_error)
+            return False
+
+    def key_guard_active(self):
+        try:
+            return self.key_guard is not None and self.key_guard.active()
+        except Exception as error:
+            self.key_guard_error = 'Sleep-key guard verification failed: ' + str(error)
+            return False
+
     def acquire(self):
         if self.shutting_down:
             raise dbus.DBusException('Agent is shutting down', name=IFACE + '.Unavailable')
@@ -1828,6 +1898,7 @@ class Agent(dbus.service.Object):
             self.session_owner_generation += 1
             self.inhibitor_outcome = 'held'
             self.release_attempts = 0
+            self.acquire_key_guard()
             self.enabled = True
             if self.acquisition_error and self.last_error == self.acquisition_error:
                 self.last_error = ""
@@ -2006,6 +2077,11 @@ class Agent(dbus.service.Object):
                 if str(login_owner) != operation['login_owner']:
                     fail(dbus.DBusException('login1 changed during acquisition',
                                             name=IFACE + '.Unavailable'))
+                    return
+                try:
+                    self.acquire_key_guard()
+                except Exception as error:
+                    fail(error)
                     return
                 self.prevention_acquisition = None
                 GLib.source_remove(operation['source'])
@@ -2466,6 +2542,7 @@ class Agent(dbus.service.Object):
 
     def disconnect_session_bus(self, reason):
         self.shutting_down = True
+        self.restore_key_guard()
         self.cancel_release_retry()
         self.cancel_stop_deadline()
         self.inhibitor_outcome = 'disconnect-requested'
@@ -2499,6 +2576,7 @@ class Agent(dbus.service.Object):
     def on_session_bus_disconnected(self, *_args):
         """Drop local resources and exit so systemd can reconnect a fresh agent."""
         self.shutting_down = True
+        self.restore_key_guard()
         self.cancel_stop_deadline()
         self.cancel_sleep_reconcile()
         self.cancel_suspend_attempt('Session bus disconnected during suspend attempt')
@@ -2598,6 +2676,9 @@ class Agent(dbus.service.Object):
         except (dbus.DBusException, OSError, TypeError, ValueError) as error:
             released = self.mark_release_pending(error)
         finally:
+            if not self.restore_key_guard():
+                released = False
+                self.last_error = self.key_guard_error
             for attr in ("lid_fd", "fd"):
                 fd = getattr(self, attr)
                 if fd is not None:
@@ -2658,6 +2739,9 @@ class Agent(dbus.service.Object):
                 return
             operation['done'] = True
             self.prevention_release = None
+            if not self.restore_key_guard():
+                released = False
+                self.last_error = self.key_guard_error
             released = released and not operation['unknown_acquisition']
             for attr in ('lid_fd', 'fd'):
                 fd = getattr(self, attr)
@@ -2733,7 +2817,7 @@ class Agent(dbus.service.Object):
     def failsafe_power_condition_met(self):
         return (self.failsafe and self.on_battery is True and
                 self.battery_discharge_state == 'discharging' and
-                self.battery_percent is not None and self.battery_percent < self.threshold)
+                self.battery_percent is not None and self.battery_percent <= self.threshold)
 
     def failsafe_condition_met(self):
         return self.enabled and self.failsafe_power_condition_met()
@@ -2743,7 +2827,7 @@ class Agent(dbus.service.Object):
             return True
         if self.battery_percent is None:
             return False
-        return (self.battery_percent >= self.threshold or
+        return (self.battery_percent > self.threshold or
                 (self.on_battery is True and
                  self.battery_discharge_state == 'not-discharging'))
 
@@ -2799,7 +2883,7 @@ class Agent(dbus.service.Object):
                 return
             self.failsafe_triggered = True
             try:
-                self.sleep_now('Battery fell below the failsafe threshold')
+                self.sleep_now('Battery reached or fell below the failsafe threshold')
             finally:
                 finish('triggered')
 
@@ -3657,6 +3741,24 @@ class Agent(dbus.service.Object):
     def reconcile(self):
         if self.shutting_down:
             return False
+        self.refresh_system_guard()
+        if self.enabled and self.key_guard is not None:
+            missing = self.key_guard.journal_missing()
+            if missing and not self.key_journal_missing_notified:
+                self.key_journal_missing_notified = True
+                self.notify('Sleep Disabler',
+                            'Shortcut recovery file is missing. Sleep prevention remains on. '
+                            'Restore sleep-key-recovery.json before turning prevention off '
+                            'to recover your custom shortcuts; otherwise distribution defaults '
+                            'will be used when prevention is turned off.')
+            elif not missing:
+                self.key_journal_missing_notified = False
+        if not self.enabled and self.key_guard_error:
+            self.restore_key_guard()
+        if self.enabled and not self.key_guard_active():
+            self.desired = False
+            self.last_error = 'Sleep-key bindings changed; prevention disabled'
+            self.release_async(lambda _released: self.publish())
         self.reconcile_sleep_state('periodic')
         self.refresh_power_async(check_failsafe=True)
         self.refresh_brightness_capability('periodic')
@@ -3799,6 +3901,12 @@ class Agent(dbus.service.Object):
             "panelRuntimeVersion": dbus.String(self.panel_runtime_version),
             "panelRuntimeRegistered": dbus.Boolean(bool(self.panel_runtime_sender)),
             "enabled": dbus.Boolean(self.enabled),
+            "keyGuardActive": dbus.Boolean(bool(self.enabled and self.key_guard_active())),
+            "keyGuardError": dbus.String(self.key_guard_error),
+            "systemGuardState": dbus.String(
+                self.system_guard_state if time.monotonic() - self.system_guard_checked < 35
+                else 'checking'),
+            "systemGuardError": dbus.String(self.system_guard_error),
             "desired": dbus.Boolean(self.desired),
             "gnomeInhibitorState": dbus.String(self.session_cookie_state),
             "gnomeReleasePending": dbus.Boolean(self.session_cookie_state == 'release-pending'),
