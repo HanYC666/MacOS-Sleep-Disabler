@@ -1,5 +1,13 @@
 # GNOME Wayland plan 0.8 implementation ledger
 
+## Configurable lock behavior (2026-10-24)
+
+Pre-push verification: 398 isolated Python tests completed successfully (one existing systemd-verifier sandbox skip), including 225 agent, 85 core installer, 44 user installer, and 17 shortcut-guard tests. The GJS panel callback/lifecycle/error and suspend-hook harnesses passed with fake UI/bus objects. No host sleep operation was issued. Node is unavailable here, so the separate Node harness was not rerun; GJS exercised the extension callbacks. These results do not replace live Shell or hardware checks.
+
+Current source is agent `0.7.1`, D-Bus API `7`, and panel runtime/metadata `8`. The saved **Lock screen when lid closes** option defaults on and controls lid-transition locking plus the existing sleep-key and Shell Suspend redirection. Off retains prevention and blocks those actions without locking; the normal lock shortcut is preserved. The agent observes open-to-closed lid changes through UPower and requests `org.gnome.ScreenSaver.Lock()` only while prevention and the preference are on. Preference changes retain inhibitors and require an intact shortcut recovery journal while active.
+
+The matching core and panel files were installed on this laptop with prevention verified on and the failsafe retained at 5%. The installed panel files are version 8, but the prior session cached version 7; loading and verifying panel 8 requires logout/login. Fresh agent processes start with prevention off, so prevention must be enabled again afterward. No live lock, lid-close, or suspend test was performed. The deployment and settings in the older sections below are historical snapshots, not current state. See the [upgrade instructions](README.md#upgrade-to-the-configurable-lock-behavior) for runtime checks and remaining hardware limitations.
+
 ## Subsequent plan 0.9 result (2026-10-19)
 
 [Plan 0.9](planning/plan0.9.md) records the newer manual-sleep prevention and

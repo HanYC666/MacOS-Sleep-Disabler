@@ -11,7 +11,7 @@ import * as SystemActions from 'resource:///org/gnome/shell/misc/systemActions.j
 const APP = 'org.sleepdisabler.App';
 const PATH = '/org/sleepdisabler/App';
 const IFACE = 'org.sleepdisabler.App1';
-const PANEL_RUNTIME_VERSION = '7';
+const PANEL_RUNTIME_VERSION = '8';
 const STATE_ATTEMPTS = 3;
 const STATE_RETRY_DELAYS = [1, 2];
 const REGISTRATION_ATTEMPTS = 3;
@@ -70,6 +70,16 @@ export default class SleepDisablerExtension extends Extension {
                 this._call('SetLidMode', new GLib.Variant('(b)', [enabled]));
         });
         this._button.menu.addMenuItem(this._lid);
+
+        this._lockOnLidClose = new PopupMenu.PopupSwitchMenuItem('Lock screen when lid closes', true);
+        this._lockOnLidClose.connect('toggled', (_item, enabled) => {
+            if (!this._updating)
+                this._call('SetLockOnLidClose', new GLib.Variant('(b)', [enabled]));
+        });
+        this._button.menu.addMenuItem(this._lockOnLidClose);
+        this._button.menu.addMenuItem(new PopupMenu.PopupMenuItem(
+            'Only while prevention is active.\nAlso controls sleep-key and Suspend locking.',
+            {reactive: false}));
 
         this._dimming = new PopupMenu.PopupSwitchMenuItem('Dim panel on lid close', false);
         this._dimming.connect('toggled', (_item, enabled) => {
@@ -354,7 +364,7 @@ export default class SleepDisablerExtension extends Extension {
         this._status.label.text = connectionState === 'connecting' ? 'Connecting…' :
             connectionState === 'retrying' ? 'Connecting… retrying' :
             connectionState === 'connected' ? 'Connected' : 'Agent not connected';
-        for (const item of [this._prevention, this._lid, this._dimming, this._failsafe, this._cancel, ...this._timerItems])
+        for (const item of [this._prevention, this._lid, this._lockOnLidClose, this._dimming, this._failsafe, this._cancel, ...this._timerItems])
             item.setSensitive(false);
         this._icon.icon_name = connectionState === 'connected' ?
             'weather-clear-night-symbolic' : 'dialog-warning-symbolic';
@@ -364,7 +374,10 @@ export default class SleepDisablerExtension extends Extension {
         if (on && !this._suspendGuard) {
             this._systemActions = SystemActions.getDefault();
             this._previousSuspend = this._systemActions.activateSuspend;
-            this._suspendGuard = () => Main.screenShield.lock(true);
+            this._suspendGuard = () => {
+                if (Boolean(value(this._state, 'lockOnLidClose', true)))
+                    Main.screenShield.lock(true);
+            };
             this._systemActions.activateSuspend = this._suspendGuard;
         } else if (!on && this._suspendGuard) {
             // Preserve an override installed by another extension after ours.
@@ -432,12 +445,14 @@ export default class SleepDisablerExtension extends Extension {
         this._updating = true;
         this._prevention.setToggleState(desired);
         this._lid.setToggleState(lidRequested);
+        this._lockOnLidClose.setToggleState(Boolean(value(state, 'lockOnLidClose', true)));
         this._dimming.setToggleState(Boolean(value(state, 'lidDimming', false)));
         this._failsafe.setToggleState(Boolean(value(state, 'failsafe', false)));
         this._updating = false;
         for (const item of [this._prevention, this._lid, this._failsafe, ...this._timerItems])
             item.setSensitive(true);
         this._prevention.setSensitive(!releasePending);
+        this._lockOnLidClose.setSensitive(value(state, 'lockOnLidClose', null) !== null && !releasePending);
         this._dimming.setSensitive(Boolean(value(state, 'brightnessAvailable', false)) ||
             Boolean(value(state, 'lidDimming', false)));
         this._cancel.setSensitive(String(value(state, 'timerPhase', 'idle')) === 'running');

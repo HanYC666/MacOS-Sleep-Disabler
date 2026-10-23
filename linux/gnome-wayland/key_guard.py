@@ -73,14 +73,14 @@ class GnomeKeyGuard:
                 all(self.user_value(key) == entry['written']
                     for key, entry in entries.items()))
 
-    def acquire(self):
+    def acquire(self, lock_redirect=True):
         if self.active():
             return
         self.restore()
         if not all(self.settings.is_writable(key) for key in KEYS):
             raise ValueError('GNOME sleep-key settings are locked by administrator policy')
         lock_bindings = list(self.settings.get_strv(LOCK_KEY))
-        for key in SLEEP_KEYS:
+        for key in SLEEP_KEYS if lock_redirect else ():
             for binding in self.settings.get_strv(key):
                 if binding and binding not in lock_bindings:
                     lock_bindings.append(binding)

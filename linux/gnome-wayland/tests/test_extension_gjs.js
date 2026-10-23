@@ -108,7 +108,7 @@ panel._connected(bus, ':1.agent');
 check(calls.length === 2, 'connection requests state and registration');
 check(calls[0][7] === 3000, 'status call uses the three-second bound');
 check(calls[1][3] === 'RegisterPanelRuntime', 'runtime registration method');
-check(calls[1][4].deep_unpack()[0] === '7', 'current runtime version');
+check(calls[1][4].deep_unpack()[0] === '8', 'current runtime version');
 
 const state = {enabled: true, desired: true, timerRemaining: 0};
 calls[0][9](bus, {deep_unpack: () => [state]});
@@ -288,7 +288,7 @@ newOwnerRegistration[9](bus, {error: 'remote success followed by timeout'});
 fireTimer(changedDuringRetry._registrationRetry);
 const repeatedRegistration = calls.at(-1);
 check(repeatedRegistration[0] === ':1.after' &&
-    repeatedRegistration[4].deep_unpack()[0] === '7',
+    repeatedRegistration[4].deep_unpack()[0] === '8',
     'timeout retry repeats registration for the same owner and version');
 repeatedRegistration[9](bus, {});
 check(changedDuringRetry._registrationState === 'succeeded',
@@ -333,6 +333,22 @@ guardPanel.enable();
 guardPanel._syncSuspendGuard(true);
 systemActions.activateSuspend();
 check(lockCalls === 1 && originalCalls === 0, 'prevention redirects suspend to lock');
+guardPanel._state = {lockOnLidClose: false};
+systemActions.activateSuspend();
+check(lockCalls === 1 && originalCalls === 0, 'disabled locking still blocks Suspend');
+guardPanel._state = {lockOnLidClose: true};
+systemActions.activateSuspend();
+check(lockCalls === 2 && originalCalls === 0, 'locking can be enabled without removing the guard');
+guardPanel._connectionState = 'connected';
+guardPanel._bus = bus;
+guardPanel._render({enabled: true, desired: true, lockOnLidClose: false});
+check(guardPanel._lockOnLidClose.toggle === false && guardPanel._lockOnLidClose.sensitive,
+    'panel displays the persisted preference');
+guardPanel._lockOnLidClose.handlers.toggled(null, true);
+check(calls.at(-1)[3] === 'SetLockOnLidClose' && calls.at(-1)[4].deep_unpack()[0] === true,
+    'GUI locking switch uses the boolean API');
+guardPanel._render({enabled: true, desired: true});
+check(!guardPanel._lockOnLidClose.sensitive, 'older agents cannot accept the new setting');
 guardPanel._syncSuspendGuard(true);
 guardPanel._syncSuspendGuard(false);
 check(systemActions.activateSuspend === originalSuspend, 'off restores original suspend action');

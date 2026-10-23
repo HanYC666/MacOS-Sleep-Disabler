@@ -106,6 +106,87 @@ class FakeBrightness:
 
 
 class AgentTests(unittest.TestCase):
+    def test_lock_preference_defaults_validation_and_persistence(self):
+        a = self.agent
+        self.assertTrue(a.validate_settings({})['lock_on_lid_close'])
+        with self.assertRaises(ValueError):
+            a.validate_settings({'lock_on_lid_close': 1})
+        a.SetLockOnLidClose(False)
+        a.lock_on_lid_close = True
+        a.load_settings()
+        self.assertFalse(a.lock_on_lid_close)
+
+    def test_lock_preference_switches_keys_without_releasing_inhibitors(self):
+        a = self.agent
+        a.enabled = True
+        a.key_guard.journal_missing.return_value = False
+        a.release = mock.Mock()
+        a.SetLockOnLidClose(False)
+        a.key_guard.restore.assert_called_once_with()
+        a.key_guard.acquire.assert_called_once_with(lock_redirect=False)
+        a.release.assert_not_called()
+        self.assertTrue(a.enabled)
+
+    def test_lock_preference_missing_journal_preserves_current_state(self):
+        a = self.agent
+        a.enabled = True
+        a.key_guard.journal_missing.return_value = True
+        with self.assertRaises(FakeDBusException):
+            a.SetLockOnLidClose(False)
+        a.key_guard.restore.assert_not_called()
+        self.assertTrue(a.lock_on_lid_close)
+
+    def test_lock_preference_persistence_failure_restores_prior_key_mode(self):
+        a = self.agent
+        a.enabled = True
+        a.key_guard.journal_missing.return_value = False
+        with mock.patch.object(agent_module, 'atomic_json', side_effect=OSError('disk full')):
+            with self.assertRaises(FakeDBusException):
+                a.SetLockOnLidClose(False)
+        self.assertTrue(a.lock_on_lid_close)
+        self.assertTrue(a.enabled)
+        self.assertEqual(a.key_guard.acquire.call_args_list,
+                         [mock.call(lock_redirect=False), mock.call(lock_redirect=True)])
+
+    def test_lid_lock_requires_enabled_preference_and_observed_close(self):
+        a = self.agent
+        a.proxy = mock.Mock()
+        for enabled, preference, previous, closed, stopping in (
+                (False, True, False, True, False), (True, False, False, True, False),
+                (True, True, None, True, False), (True, True, True, True, False),
+                (True, True, False, None, False), (True, True, False, False, False),
+                (True, True, False, True, True)):
+            a.enabled, a.lock_on_lid_close = enabled, preference
+            a.lid_closed, a.shutting_down = closed, stopping
+            a.lock_for_lid_close(previous)
+        a.proxy.assert_not_called()
+        a.enabled = a.lock_on_lid_close = a.lid_closed = True
+        a.shutting_down = False
+        a.lock_for_lid_close(False)
+        a.proxy.assert_called_once_with(a.session_bus, 'org.gnome.ScreenSaver',
+                                       '/org/gnome/ScreenSaver', 'org.gnome.ScreenSaver')
+        a.proxy.return_value.Lock.assert_called_once()
+        a.proxy.return_value.Lock.call_args.kwargs['error_handler'](FakeDBusException('unavailable'))
+        self.assertIn('Could not lock screen', a.last_error)
+        self.assertTrue(a.enabled)
+
+    def test_async_power_refresh_locks_once_for_a_real_close(self):
+        a = self.agent
+        a.enabled = True
+        a.lock_for_lid_close = mock.Mock(wraps=a.lock_for_lid_close)
+        a.proxy = mock.Mock()
+        for previous, expected in ((False, 1), (True, 0), (None, 0)):
+            with self.subTest(previous=previous):
+                a.lid_closed = previous
+                a.power_last_known_lid = previous
+                a.proxy.reset_mock()
+                operation = {'source': 0, 'restart_needed': False, 'reconcile_lid': True,
+                             'waiters': [], 'check_failsafe': False}
+                a.power_refresh = operation
+                a.finish_power_refresh(operation, (False, True, 80, 'not-discharging'))
+                self.assertEqual(a.proxy.return_value.Lock.call_count, expected)
+
+
     def test_upower_property_evidence_rejects_malformed_values(self):
         for value in (True, False, '2', b'2', 2.0, -1, 0x100000000, None):
             with self.subTest(kind=value):
@@ -785,6 +866,7 @@ class AgentTests(unittest.TestCase):
         a.desired = False
         a.lid_mode = False
         a.lid_dimming = False
+        a.lock_on_lid_close = True
         a.lid_closed = False
         a.lid_fd = None
         a.lid_acquisition = None
@@ -2346,8 +2428,8 @@ class AgentTests(unittest.TestCase):
         register('5')
         self.agent.UnregisterPanelRuntime('5', sender=':1.42')
         self.assertFalse(self.agent.state()['panelRuntimeRegistered'])
-        self.assertEqual(self.agent.state()['agentRuntimeVersion'], '0.7.0')
-        self.assertEqual(self.agent.state()['apiVersion'], 6)
+        self.assertEqual(self.agent.state()['agentRuntimeVersion'], '0.7.1')
+        self.assertEqual(self.agent.state()['apiVersion'], 7)
 
     def test_panel_registration_rejects_non_shell_and_stale_owner_replies(self):
         names = types.SimpleNamespace(GetNameOwner=mock.Mock())

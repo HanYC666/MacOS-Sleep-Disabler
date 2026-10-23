@@ -69,6 +69,7 @@ function makePanel() {
     panel._icon = {};
     panel._prevention = item();
     panel._lid = item();
+    panel._lockOnLidClose = item();
     panel._dimming = item();
     panel._failsafe = item();
     panel._cancel = item();
@@ -125,7 +126,7 @@ assert.equal(panel._prevention.sensitive, false);
 assert.equal(panel._status.label.text, 'Connecting…');
 assert.equal(calls.length, 2, 'connecting requests state and registers the runtime');
 assert.equal(calls[1][3], 'RegisterPanelRuntime');
-assert.equal(calls[1][4].deep_unpack()[0], '7');
+assert.equal(calls[1][4].deep_unpack()[0], '8');
 
 // A current-generation StateChanged may establish connection before GetState.
 const stateSubscription = subscriptions.find(entry => entry.signal === 'StateChanged');

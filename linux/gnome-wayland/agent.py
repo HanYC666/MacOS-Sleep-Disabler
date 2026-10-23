@@ -64,8 +64,8 @@ DEFINITE_SUSPEND_REJECTIONS = frozenset((
     'org.freedesktop.login1.OperationInProgress',
 ))
 LOG = logging.getLogger("sleep-disabler")
-AGENT_RUNTIME_VERSION = "0.7.0"
-API_VERSION = 6
+AGENT_RUNTIME_VERSION = "0.7.1"
+API_VERSION = 7
 PANEL_VERSION_RE = re.compile(r"^[1-9][0-9]*(?:\.[0-9]+){0,2}$")
 
 
@@ -304,6 +304,7 @@ class Agent(dbus.service.Object):
         self.desired = False
         self.lid_mode = False
         self.lid_dimming = False
+        self.lock_on_lid_close = True
         self.failsafe = False
         self.failsafe_triggered = False
         self.failsafe_evaluation = None
@@ -489,10 +490,13 @@ class Agent(dbus.service.Object):
                     "timer_require_lid", "timer_require_prevention"):
             if type(values.get(key, False)) is not bool:
                 raise ValueError("invalid " + key)
+        if type(values.get("lock_on_lid_close", True)) is not bool:
+            raise ValueError("invalid lock_on_lid_close")
         return {
             "threshold": threshold, "failsafe": values.get("failsafe", False),
             "lid_mode": values.get("lid_mode", False),
             "lid_dimming": values.get("lid_dimming", False),
+            "lock_on_lid_close": values.get("lock_on_lid_close", True),
             "timer_minutes": minutes,
             "timer_require_lid": values.get("timer_require_lid", False),
             "timer_require_prevention": values.get("timer_require_prevention", False),
@@ -504,6 +508,7 @@ class Agent(dbus.service.Object):
         self.failsafe = values["failsafe"]
         self.lid_mode = values["lid_mode"]
         self.lid_dimming = values["lid_dimming"]
+        self.lock_on_lid_close = values["lock_on_lid_close"]
         self.last_timer_minutes = values["timer_minutes"]
         self.last_timer_require_lid = values["timer_require_lid"]
         self.last_timer_require_prevention = values["timer_require_prevention"]
@@ -519,6 +524,7 @@ class Agent(dbus.service.Object):
     def settings(self):
         return {"threshold": self.threshold, "failsafe": self.failsafe,
                   "lid_mode": self.lid_mode, "lid_dimming": self.lid_dimming,
+                  "lock_on_lid_close": self.lock_on_lid_close,
                   "timer_minutes": self.last_timer_minutes,
                   "timer_require_lid": self.last_timer_require_lid,
                   "timer_require_prevention": self.last_timer_require_prevention}
@@ -1404,6 +1410,7 @@ class Agent(dbus.service.Object):
         # In-process compatibility path; exported D-Bus operations use the
         # bounded asynchronous refresh. Supersede older background reads.
         self.cancel_power_refresh()
+        observed_lid = self.lid_closed
         old_lid = (self.lid_closed if self.lid_closed is not None else
                    self.power_last_known_lid)
         complete = False
@@ -1471,6 +1478,8 @@ class Agent(dbus.service.Object):
                 self.brightness_redim_suppressed = False
             if reconcile_lid:
                 self.handle_lid_change()
+        if reconcile_lid:
+            self.lock_for_lid_close(observed_lid)
         self.publish()
 
     def cancel_power_refresh(self):
@@ -1520,6 +1529,7 @@ class Agent(dbus.service.Object):
         restart = operation['restart_needed'] and not self.shutting_down
         if restart:
             snapshot = None
+        observed_lid = self.lid_closed
         old_lid = (self.lid_closed if self.lid_closed is not None else
                    self.power_last_known_lid)
         if snapshot is None:
@@ -1552,6 +1562,7 @@ class Agent(dbus.service.Object):
         if reconcile_lid_change and self.lid_closed == snapshot_lid and not self.shutting_down:
             try:
                 self.handle_lid_change()
+                self.lock_for_lid_close(observed_lid)
             except Exception:
                 LOG.exception('Power refresh lid reconciliation failed')
         if snapshot is not None and operation['check_failsafe'] and not self.shutting_down:
@@ -1804,6 +1815,23 @@ class Agent(dbus.service.Object):
         elif self.lid_closed is True:
             self.reconcile_brightness_async('lid-close')
 
+    def lock_for_lid_close(self, previous_lid):
+        # Only an observed open-to-closed transition is a physical close.
+        # Startup, unknown readings and enabling the preference cannot lock.
+        if (previous_lid is not False or self.lid_closed is not True or
+                not self.enabled or not self.lock_on_lid_close or self.shutting_down):
+            return
+        def failed(error):
+            self.last_error = 'Could not lock screen on lid close: ' + str(error)
+            self.publish()
+        try:
+            self.proxy(self.session_bus, 'org.gnome.ScreenSaver',
+                       '/org/gnome/ScreenSaver', 'org.gnome.ScreenSaver').Lock(
+                timeout=RECOVERY_CALL_TIMEOUT, reply_handler=lambda: None,
+                error_handler=failed)
+        except Exception as error:
+            failed(error)
+
     def refresh_system_guard(self):
         if self.system_guard_pending or self.shutting_down:
             return
@@ -1832,7 +1860,7 @@ class Agent(dbus.service.Object):
         if self.key_guard is None:
             raise ValueError(self.key_guard_error or 'GNOME sleep-key guard unavailable')
         try:
-            self.key_guard.acquire()
+            self.key_guard.acquire(lock_redirect=self.lock_on_lid_close)
             self.key_guard_error = ''
         except Exception as error:
             self.key_guard_error = 'Sleep-key redirection failed: ' + str(error)
@@ -3919,6 +3947,7 @@ class Agent(dbus.service.Object):
             "lidError": dbus.String(self.lid_error),
             "lidInhibitor": dbus.Boolean(self.lid_fd is not None),
             "lidDimming": dbus.Boolean(self.lid_dimming),
+            "lockOnLidClose": dbus.Boolean(self.lock_on_lid_close),
             "lidClosed": dbus.String("unknown" if self.lid_closed is None else ("yes" if self.lid_closed else "no")),
             "brightnessDimmed": dbus.Boolean(self.brightness_record is not None and
                                              self.brightness_record.get("phase") == "applied"),
@@ -4535,6 +4564,36 @@ class Agent(dbus.service.Object):
             self.acquire_lid_async(acquired)
         else:
             acquired(None)
+
+    @dbus.service.method(IFACE, in_signature="b", out_signature="")
+    def SetLockOnLidClose(self, enabled):
+        if self.shutting_down:
+            raise dbus.DBusException('Agent is shutting down', name=IFACE + '.Unavailable')
+        enabled = bool(enabled)
+        previous = self.lock_on_lid_close
+        if enabled == previous:
+            return
+        if self.enabled:
+            if self.key_guard.journal_missing():
+                raise dbus.DBusException('Restore the shortcut recovery file before changing lock behavior',
+                                         name=IFACE + '.InvalidState')
+            try:
+                self.key_guard.restore()
+                self.key_guard.acquire(lock_redirect=enabled)
+                self.persist_settings(lock_on_lid_close=enabled)
+            except Exception:
+                # Inhibitors stay held throughout a shortcut-mode change.
+                # A visible committed setting remains authoritative.
+                try:
+                    self.key_guard.restore()
+                    self.key_guard.acquire(lock_redirect=self.lock_on_lid_close)
+                except Exception as recovery_error:
+                    self.key_guard_error = 'Shortcut mode recovery failed: ' + str(recovery_error)
+                self.publish()
+                raise
+        else:
+            self.persist_settings(lock_on_lid_close=enabled)
+        self.publish()
 
     @dbus.service.method(IFACE, in_signature="b", out_signature="",
                          async_callbacks=('reply', 'error'))

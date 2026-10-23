@@ -54,6 +54,28 @@ class Settings:
 
 
 class KeyGuardTests(unittest.TestCase):
+    def test_disabled_redirect_blocks_sleep_keys_and_preserves_normal_lock(self):
+        self.guard.acquire(lock_redirect=False)
+        self.assertTrue(self.guard.active())
+        for key in module.SLEEP_KEYS:
+            self.assertEqual(self.settings.get_strv(key), [])
+        self.assertEqual(self.settings.get_strv(module.LOCK_KEY), ['<Super>l'])
+        self.guard.restore()
+        self.assertEqual(self.settings.values, {})
+
+    def test_redirect_modes_round_trip_preserves_custom_shortcuts(self):
+        self.settings.values = {'screensaver': ['<Super>k'], 'suspend': ['<Super>s']}
+        prior = copy.deepcopy(self.settings.values)
+        for mode in (True, False, True, False):
+            self.guard.restore()
+            self.guard.acquire(lock_redirect=mode)
+            bindings = self.settings.get_strv(module.LOCK_KEY)
+            self.assertEqual('<Super>s' in bindings, mode)
+            self.assertIn('<Super>k', bindings)
+            self.assertTrue(self.guard.active())
+        self.guard.restore()
+        self.assertEqual(self.settings.values, prior)
+
     def setUp(self):
         self.directory = tempfile.TemporaryDirectory()
         self.addCleanup(self.directory.cleanup)
