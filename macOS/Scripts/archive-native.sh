@@ -21,6 +21,7 @@ module_cache_path="${output_directory}/.swift-module-cache"
 notary_profile="${NOTARYTOOL_PROFILE:-}"
 source_files=(
   "Sleep Disabler/ContentView.swift"
+  "Sleep Disabler/LidLockPolicy.swift"
   "Sleep Disabler/Sleep_DisablerApp.swift"
 )
 

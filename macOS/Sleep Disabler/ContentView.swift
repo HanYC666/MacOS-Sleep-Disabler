@@ -46,6 +46,13 @@ struct MainView: View {
     @EnvironmentObject var appState: AppState
 
     var body: some View {
+        ScrollView {
+            settingsContent.padding(20)
+        }
+        .frame(minWidth: 420, maxWidth: 460, minHeight: 600)
+    }
+
+    private var settingsContent: some View {
         VStack(spacing: 16) {
             Text("Sleep Disabler")
                 .font(.title)
@@ -129,23 +136,39 @@ struct MainView: View {
 
             Divider()
 
-            VStack(alignment: .leading, spacing: 6) {
-                Toggle(isOn: $appState.lidDimmerEnabled) {
-                    Text("Lid-Closed Dimmer (When Disabled)")
-                        .fontWeight(.medium)
-                }
-                .disabled(!appState.supportsLidDimmer)
+            GroupBox {
+                VStack(alignment: .leading, spacing: 12) {
+                    lidBehaviorRow(
+                        "Lock Screen When Lid Closes",
+                        symbol: "lock",
+                        description: appState.supportsLidLock
+                            ? "Locks your session when you close the lid."
+                            : "Unavailable on this Mac or macOS version.",
+                        isOn: $appState.lockOnLidClose,
+                        available: appState.supportsLidLock
+                    )
 
-                if !appState.supportsLidDimmer {
-                    Text("Available on MacBooks only.")
-                        .font(.caption)
-                        .foregroundColor(.secondary)
-                } else if appState.lidDimmerEnabled {
-                    Text("Turns display brightness to 0% when laptop lid is closed to save battery, restoring it when opened.")
+                    Divider()
+
+                    lidBehaviorRow(
+                        "Dim Display When Lid Closes",
+                        symbol: "sun.min",
+                        description: appState.supportsLidDimmer
+                            ? "Sets brightness to zero and restores it when opened."
+                            : "Requires a MacBook with brightness control.",
+                        isOn: $appState.lidDimmerEnabled,
+                        available: appState.supportsLidDimmer
+                    )
+
+                    Text("Applies only while sleep prevention is active.")
                         .font(.caption)
                         .foregroundColor(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
                 }
+                .padding(6)
+            } label: {
+                Text("Lid Behavior")
+                    .fontWeight(.medium)
             }
             .frame(maxWidth: .infinity, alignment: .leading)
 
@@ -197,11 +220,34 @@ struct MainView: View {
                 .labelsHidden()
                 .frame(width: 156)
             }
-
-            Spacer()
         }
-        .padding(20)
-        .frame(minWidth: 420, maxWidth: 460, minHeight: 600)
+    }
+
+    private func lidBehaviorRow(
+        _ title: String, symbol: String, description: String,
+        isOn: Binding<Bool>, available: Bool
+    ) -> some View {
+        HStack(alignment: .top, spacing: 10) {
+            Image(systemName: symbol)
+                .foregroundColor(.secondary)
+                .frame(width: 20, height: 22)
+                .accessibilityHidden(true)
+            VStack(alignment: .leading, spacing: 3) {
+                Text(title)
+                    .fontWeight(.medium)
+                Text(description)
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            Spacer(minLength: 8)
+            Toggle(title, isOn: isOn)
+                .toggleStyle(.switch)
+                .labelsHidden()
+                .disabled(!available)
+                .help("Applies only while sleep prevention is active.")
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
     }
 
     private func timerValue(_ title: String, value: Binding<Int>, range: ClosedRange<Int>) -> some View {

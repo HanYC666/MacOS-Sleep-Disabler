@@ -18,6 +18,7 @@ Ram usage: 27.6 MB with all functions turned on.
 - **Dynamic State Saving**: Remembers exactly what your Mac's sleep settings were before disabling sleep, and perfectly restores them when re-enabled.
 - **Battery Failsafe**: Let's you set a custom battery percentage (like 5%). If the battery drops below this while sleep is disabled, the app saves your Mac by forcing it to sleep and dropping a notification window.
 - **Lid-Closed Dimmer**: When sleep is disabled, you can close your MacBook lid to drop the screen brightness completely to 0 (so it doesn't glow or waste power) while still keeping the Mac wide awake. Opening the lid brings your brightness right back!
+- **Lock Screen When Lid Closes**: Optionally lock your MacBook when you close its lid while sleep prevention is active. Find the switch under **Lid Behavior** or in the menu-bar menu. The preference is saved and starts off for existing and new installations.
 - **Sleep Scheduler**: Set a days, hours, and minutes countdown to put your Mac to sleep. The last duration and its safety options are saved, and menu-bar mode provides a quick start action plus a live remaining-time display.
 
 ## Requirements
@@ -30,7 +31,11 @@ Ram usage: 27.6 MB with all functions turned on.
 
 Download `Sleep-Disabler-arm64.zip` for Apple Silicon or `Sleep-Disabler-x86_64.zip` for Intel. Each archive contains a separate native `.app`; neither is a universal binary.
 
+Extract the matching archive and copy the app into Applications. For an upgrade, quit the existing app before replacing it, and keep its preferences so saved settings remain available. Copying an app does not launch it; open it when ready to use it. The new lid-lock feature is currently available in source only; existing release ZIPs have not been rebuilt. Follow [compile.md](compile.md) to build it, then copy the matching app from `build/native-archives` into Applications.
+
 On the first launch, the app opens in Window Mode. This makes it easier to find, especially on MacBook Pro where a menu bar icon could be hidden near the camera notch.
+
+In **Lid Behavior**, enable **Lock Screen When Lid Closes** if desired. It starts off and remembers subsequent changes. **Disable Sleep** activates prevention; the lid settings apply only while prevention is active. Dimming and locking are independent. Menu Bar mode offers the same lock preference as a checked menu item. A disabled switch means this Mac or macOS version lacks the required lid or locking capability. Locking needs neither an extra `sudoers` rule nor simulated keyboard shortcuts.
 
 ## Permissions
 
@@ -70,7 +75,7 @@ Only add a `sudoers` rule if you understand what it does. If you want to remove 
 
 ## Building from source
 
-From the project root, run `zsh Scripts/archive-native.sh` without `sudo`. The script uses only Xcode Command Line Tools and creates separate Apple Silicon and Intel apps. See [RELEASE.md](RELEASE.md) and [compile.md](compile.md).
+From the repository root, run `cd macOS`, then `zsh Scripts/archive-native.sh` without `sudo`. The script uses only Xcode Command Line Tools and creates separate Apple Silicon and Intel apps. See [RELEASE.md](RELEASE.md) and [compile.md](compile.md).
 
 The deployment target is macOS 13.5+ by project default.
 
@@ -97,6 +102,10 @@ sudo pmset -c displaysleep <saved_ac_displaysleep>
 For the **Battery Failsafe**, the app uses IOKit Power Sources values and change notifications. It checks the system's current power provider separately, so charging or AC operation cannot be mistaken for battery discharge.
 
 For the **Lid-Closed Dimmer**, the app reads `AppleClamshellState` directly through IOKit and listens for general IOKit and workspace power events. Apple does not expose a supported lid-specific event API, so a direct IOKit fallback check runs only while a lid-dependent feature is active. The control is greyed out unless the Apple-reported model name contains `MacBook` and brightness control is available.
+
+**Lock Screen When Lid Closes** shares that lid monitor but works independently of brightness control. It requests a lock only on an observed open-to-closed transition while prevention and the option are both on. Startup, enabling the option with an already-closed lid, unreadable sensor data, and repeated closed readings do not trigger locks. Locking uses the dynamically resolved private `SACLockScreenImmediate` function in `login.framework`, also used by [Hammerspoon](https://github.com/Hammerspoon/hammerspoon/blob/master/extensions/caffeinate/libcaffeinate.m). The switch is unavailable if lid monitoring or the symbol is unavailable; private APIs may change between macOS releases. This setting does not intercept manual Sleep actions on macOS.
+
+Run `zsh Scripts/test-lid-lock.sh` from the macOS directory with Swift installed to exercise the standalone transition policy. These tests do not link screen-lock or power-management APIs. A native build and a real MacBook check are still needed to validate system locking and appearance; existing ZIP downloads are not rebuilt by source changes.
 
 The **Sleep Scheduler** uses the selected days, hours, and minutes as a countdown and then runs `pmset sleepnow`. Its saved values are restored at launch, so the menu-bar quick start always uses the last configured schedule. While a schedule is active, the menu displays the live remaining time. The optional closed-lid condition prevents starting while the lid is open and cancels the schedule if the lid opens. The optional sleep-disabled condition only permits a schedule while Sleep Disabler is active, and cancels it when normal sleep is restored.
 

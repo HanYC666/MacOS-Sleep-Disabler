@@ -2,19 +2,22 @@
 
 This project builds with Apple's Xcode Command Line Tools only. The archive script does not invoke the Xcode app or `xcodebuild`.
 
-1. Open Terminal and navigate into the main project folder:
+1. Open Terminal and navigate into the repository's `macOS` folder:
 
 ```bash
-cd "path/to/Sleep Disabler"
+cd "/path/to/MacOS-Sleep-Disabler/macOS"
 ```
 
-2. Run the archive script from that project root. Do not use `sudo` and do not run it from the `Scripts` folder:
+2. Run the isolated lid-lock policy tests, then the archive script from that folder. Do not use `sudo` and do not run them from the `Scripts` folder:
 
 ```bash
+zsh Scripts/test-lid-lock.sh
 zsh Scripts/archive-native.sh
 ```
 
-3. The script creates two independent native apps under `build/native-archives`. Open only the one for the Mac you are using:
+The test executable contains only the transition policy: it cannot lock the screen or suspend the computer. It checks preference/prevention gating, startup, repeated closure, unknown lid readings, and baseline resets. This is separate from native UI and hardware validation. The archive includes `ContentView.swift`, `LidLockPolicy.swift`, and `Sleep_DisablerApp.swift`.
+
+3. The script creates two independent native apps under `build/native-archives`. To install without launching, copy the matching app into Applications using Finder; quit an older copy before replacing it. To launch when ready, use only the app for your Mac:
 
 ```bash
 # Apple Silicon
@@ -25,3 +28,5 @@ open "build/native-archives/Sleep-Disabler-x86_64.app"
 ```
 
 The script uses an installed development certificate when available, otherwise it creates an ad-hoc signature for local use. See [RELEASE.md](RELEASE.md) for Developer ID notarization.
+
+If output files already exist, pass a new directory, such as `zsh Scripts/archive-native.sh build/lid-lock-review`. A source update does not update previously generated apps or ZIPs. After launching a new build, the optional locking switch appears under **Lid Behavior** and in the menu-bar menu; it defaults off and operates only while sleep prevention is active.

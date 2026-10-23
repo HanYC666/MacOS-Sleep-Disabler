@@ -34,6 +34,19 @@ private enum DisplayBrightness {
     static var isAvailable: Bool { getBrightness != nil && setBrightness != nil }
 }
 
+// Like brightness control, screen locking is an optional private macOS API.
+// Resolve it at runtime so an unavailable symbol cannot prevent app launch.
+private enum MacScreenLock {
+    typealias Lock = @convention(c) () -> Void
+    private static let handle = dlopen(
+        "/System/Library/PrivateFrameworks/login.framework/login", RTLD_LAZY
+    )
+    static let lock: Lock? = handle.flatMap { handle in
+        dlsym(handle, "SACLockScreenImmediate").map { unsafeBitCast($0, to: Lock.self) }
+    }
+    static var isAvailable: Bool { lock != nil }
+}
+
 @main
 struct SleepToggleApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) var appDelegate
@@ -103,11 +116,29 @@ private final class WindowObservationView: NSView {
 final class AppState: ObservableObject {
     private static let preferencesApplicationID = "com.ych.sleepdisabler" as CFString
     private static let lidDimmerPreferenceKey = "lidDimmerEnabled" as CFString
+    private static let lidLockPreferenceKey = "lockOnLidClose" as CFString
 
-    @Published var isFullySleepDisabled = false
+    @Published var isFullySleepDisabled = false {
+        didSet {
+            guard oldValue != isFullySleepDisabled else { return }
+            lidLockPolicy.reset()
+            updateLidMonitoring()
+        }
+    }
     @Published var launchAtLoginEnabled = false
     @Published private(set) var supportsBatteryFailsafe = false
     @Published private(set) var supportsLidDimmer = false
+    @Published private(set) var supportsLidLock = false
+
+    @Published var lockOnLidClose = false {
+        didSet {
+            guard oldValue != lockOnLidClose else { return }
+            Self.saveLidPreference(lockOnLidClose, key: Self.lidLockPreferenceKey)
+            lidLockPolicy.reset()
+            updateLidMonitoring()
+            refreshMenuBar()
+        }
+    }
 
     @Published var menuBarMode = false {
         didSet { UserDefaults.standard.set(menuBarMode, forKey: "menuBarMode") }
@@ -133,7 +164,7 @@ final class AppState: ObservableObject {
                 lidDimmerEnabled = false
                 return
             }
-            Self.saveLidDimmerPreference(lidDimmerEnabled)
+            Self.saveLidPreference(lidDimmerEnabled, key: Self.lidDimmerPreferenceKey)
             updateLidMonitoring()
             checkLidState()
         }
@@ -193,6 +224,8 @@ final class AppState: ObservableObject {
     private var originalBrightness: Float? = nil
     private var isCurrentlyDimmed = false
     private var lidCheckTimer: Timer?
+    private var supportsLidMonitoring = false
+    private var lidLockPolicy = LidLockPolicy()
     private var lidRootDomain: io_service_t = IO_OBJECT_NULL
     private var lidNotificationPort: IONotificationPortRef?
     private var lidInterestNotification: io_object_t = IO_OBJECT_NULL
@@ -233,20 +266,24 @@ final class AppState: ObservableObject {
         failsafeEnabled = UserDefaults.standard.object(forKey: "failsafeEnabled") as? Bool ?? false
         let threshold = UserDefaults.standard.integer(forKey: "failsafeThreshold")
         failsafeThreshold = threshold > 0 ? threshold : 20
-        let savedLidDimmerEnabled = Self.loadLidDimmerPreference()
+        let savedLidDimmerEnabled = Self.loadLidPreference(Self.lidDimmerPreferenceKey)
         sleepTimerDays = min(max(0, UserDefaults.standard.integer(forKey: "sleepTimerDays")), 365)
         sleepTimerHours = min(max(0, UserDefaults.standard.integer(forKey: "sleepTimerHours")), 23)
         let savedMinutes = UserDefaults.standard.object(forKey: "sleepTimerMinutes") as? Int
         sleepTimerMinutes = min(max(0, savedMinutes ?? 30), 59)
         sleepTimerLidClosedOnly = UserDefaults.standard.object(forKey: "sleepTimerLidClosedOnly") as? Bool ?? false
         sleepTimerSleepDisabledOnly = UserDefaults.standard.object(forKey: "sleepTimerSleepDisabledOnly") as? Bool ?? false
-        supportsLidDimmer = Self.isMacBook() && DisplayBrightness.isAvailable
+        let isMacBook = Self.isMacBook()
+        supportsLidDimmer = isMacBook && DisplayBrightness.isAvailable
         lidDimmerEnabled = supportsLidDimmer && savedLidDimmerEnabled
+        lockOnLidClose = Self.loadLidPreference(Self.lidLockPreferenceKey)
 
         updateActivationPolicy()
         refreshAll()
         installBatteryNotifications()
         installLidNotifications()
+        supportsLidMonitoring = isMacBook && lidRootDomain != IO_OBJECT_NULL
+        supportsLidLock = supportsLidMonitoring && MacScreenLock.isAvailable
 
         if menuBarMode {
             createMenuBar()
@@ -259,14 +296,14 @@ final class AppState: ObservableObject {
         updateLidMonitoring()
     }
 
-    private static func loadLidDimmerPreference() -> Bool {
+    private static func loadLidPreference(_ key: CFString) -> Bool {
         _ = CFPreferencesSynchronize(
             preferencesApplicationID,
             kCFPreferencesCurrentUser,
             kCFPreferencesAnyHost
         )
         let value = CFPreferencesCopyValue(
-            lidDimmerPreferenceKey,
+            key,
             preferencesApplicationID,
             kCFPreferencesCurrentUser,
             kCFPreferencesAnyHost
@@ -274,9 +311,9 @@ final class AppState: ObservableObject {
         return (value as? NSNumber)?.boolValue ?? false
     }
 
-    private static func saveLidDimmerPreference(_ enabled: Bool) {
+    private static func saveLidPreference(_ enabled: Bool, key: CFString) {
         CFPreferencesSetValue(
-            lidDimmerPreferenceKey,
+            key,
             enabled ? kCFBooleanTrue : kCFBooleanFalse,
             preferencesApplicationID,
             kCFPreferencesCurrentUser,
@@ -312,7 +349,7 @@ final class AppState: ObservableObject {
         isOpeningMainWindow = false
         let shouldReveal = shouldRevealNextMainWindow
         shouldRevealNextMainWindow = false
-        window.setContentSize(NSSize(width: 440, height: 620))
+        window.setContentSize(NSSize(width: 440, height: 740))
         window.collectionBehavior.insert(.moveToActiveSpace)
         if menuBarMode && !shouldReveal {
             window.alphaValue = 0
@@ -344,17 +381,23 @@ final class AppState: ObservableObject {
     }
 
     func updateLidMonitoring() {
-        let needsLidState = supportsLidDimmer
-            && (lidDimmerEnabled || (sleepTimerRunning && sleepTimerLidClosedOnly))
+        let needsLidState = supportsLidMonitoring
+            && ((supportsLidLock && lockOnLidClose && isFullySleepDisabled)
+                || lidDimmerEnabled || (sleepTimerRunning && sleepTimerLidClosedOnly))
         if needsLidState {
-            checkLidState()
-            guard lidCheckTimer == nil else { return }
-            lidCheckTimer = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] _ in
-                self?.checkLidState()
+            if lidCheckTimer == nil {
+                lidCheckTimer = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] _ in
+                    self?.checkLidState()
+                }
             }
+            // Checking can cancel a lid-only schedule and recursively stop
+            // monitoring. Install the timer first so it cannot be recreated
+            // after that cancellation.
+            checkLidState()
         } else {
             lidCheckTimer?.invalidate()
             lidCheckTimer = nil
+            lidLockPolicy.reset()
             if isCurrentlyDimmed { restoreBrightness() }
         }
     }
@@ -421,6 +464,7 @@ final class AppState: ObservableObject {
         updateMenuBarIcon()
 
         let menu = NSMenu()
+        menu.autoenablesItems = false
 
         let toggle = NSMenuItem(
             title: isFullySleepDisabled ? "Enable Sleep" : "Disable Sleep",
@@ -430,6 +474,17 @@ final class AppState: ObservableObject {
         toggle.target = self
         menu.addItem(toggle)
         menu.addItem(.separator())
+
+        let lidLock = NSMenuItem(
+            title: "Lock Screen When Lid Closes",
+            action: #selector(toggleLidLockMenu),
+            keyEquivalent: ""
+        )
+        lidLock.target = self
+        lidLock.isEnabled = supportsLidLock
+        lidLock.state = lockOnLidClose ? .on : .off
+        lidLock.toolTip = "Only while sleep prevention is active."
+        menu.addItem(lidLock)
 
         let dimmer = NSMenuItem(
             title: lidDimmerEnabled ? "Disable Lid Dimmer" : "Enable Lid Dimmer",
@@ -524,6 +579,10 @@ final class AppState: ObservableObject {
     @objc func showWindowMenu() { showWindow() }
     @objc func toggleModeMenu() { toggleMode() }
     @objc func toggleLoginMenu() { toggleLaunchAtLogin() }
+    @objc func toggleLidLockMenu() {
+        guard supportsLidLock else { return }
+        lockOnLidClose.toggle()
+    }
     @objc func toggleDimmerMenu() {
         guard supportsLidDimmer else { return }
         lidDimmerEnabled.toggle()
@@ -734,24 +793,32 @@ final class AppState: ObservableObject {
         NSApp.activate(ignoringOtherApps: true)
     }
 
-    // MARK: - LID DIMMER
+    // MARK: - LID BEHAVIOR
     func checkLidState() {
-        guard supportsLidDimmer,
-              lidDimmerEnabled || (sleepTimerRunning && sleepTimerLidClosedOnly) else {
+        guard supportsLidMonitoring else {
+            lidLockPolicy.reset()
             if isCurrentlyDimmed { restoreBrightness() }
             return
         }
 
-        let isClosed = isLidClosed()
+        let lidClosed = readLidClosed()
+        if lidLockPolicy.shouldLock(
+            lidClosed: lidClosed,
+            preventionActive: isFullySleepDisabled,
+            enabled: supportsLidLock && lockOnLidClose
+        ) {
+            MacScreenLock.lock?()
+        }
+        let shouldDim = supportsLidDimmer && lidDimmerEnabled && isFullySleepDisabled
+        if !shouldDim && isCurrentlyDimmed { restoreBrightness() }
+        // Unknown sensor data must not be interpreted as opening the lid.
+        guard let isClosed = lidClosed else { return }
 
         if sleepTimerRunning && sleepTimerLidClosedOnly && !isClosed {
             sleepTimerRunning = false
         }
 
-        guard lidDimmerEnabled, isFullySleepDisabled else {
-            if isCurrentlyDimmed { restoreBrightness() }
-            return
-        }
+        guard shouldDim else { return }
 
         if isClosed && !isCurrentlyDimmed {
             dimBrightness()
@@ -761,15 +828,19 @@ final class AppState: ObservableObject {
     }
 
     private func isLidClosed() -> Bool {
+        readLidClosed() == true
+    }
+
+    private func readLidClosed() -> Bool? {
         guard lidRootDomain != IO_OBJECT_NULL,
               let value = IORegistryEntryCreateCFProperty(
                 lidRootDomain,
                 "AppleClamshellState" as CFString,
                 kCFAllocatorDefault,
                 0
-              )?.takeRetainedValue() else { return false }
+              )?.takeRetainedValue() else { return nil }
         if let bool = value as? Bool { return bool }
-        return (value as? NSNumber)?.boolValue ?? false
+        return (value as? NSNumber)?.boolValue
     }
 
     private func installLidNotifications() {
