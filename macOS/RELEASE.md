@@ -5,6 +5,8 @@ Sleep Disabler ships two separate apps, not a universal binary:
 - `Sleep-Disabler-arm64.app` for Apple Silicon Macs.
 - `Sleep-Disabler-x86_64.app` for Intel Macs.
 
+These are the archive script's output names. For distribution, rename each app to `Sleep Disabler.app` in a separate staging directory, then compress it as `Sleep-Disabler-arm64.zip` or `Sleep-Disabler-x86_64.zip` respectively. Both distributed ZIPs contain `Sleep Disabler.app`; keep each app paired with its verified architecture.
+
 Run the archive script from the repository's `macOS` directory. Do not run it with `sudo` and do
 not run it from inside the `Scripts` directory.
 
@@ -36,9 +38,11 @@ its requested architecture.
 
 ## Lid-lock release validation
 
-The current lid-lock implementation is unreleased source; the existing ZIPs do not contain it. Before replacing release downloads:
+Both repository ZIPs have been rebuilt with the lid-lock implementation using Xcode Command Line Tools. The builds passed single-architecture and local ad-hoc signature verification, and all 30 isolated policy checks passed. The maintainer completed manual testing of all app functionality and confirmed it works correctly. The changelog entry remains unreleased until a release is designated.
 
-- Run the isolated policy tests and compile both architectures. `LidLockPolicy.swift` must be included alongside the app and view sources; the archive script already does this. These tests cannot lock or suspend the host.
+Use the following checklist for subsequent releases:
+
+- For subsequent builds, run the isolated policy tests and compile both architectures. `LidLockPolicy.swift` must be included alongside the app and view sources; the archive script already does this. These tests cannot lock or suspend the host.
 - On a MacBook, inspect **Lid Behavior** in light and dark appearance, check caption wrapping and scrolling at the smallest window size, and verify that the window and checked menu-bar item stay synchronized.
 - Verify the default-off preference survives enabling, disabling, and relaunching. Confirm that unavailable lid monitoring or the private `SACLockScreenImmediate` symbol disables the control without preventing launch, and that locking works with the dimmer off.
 - In an attended hardware session, verify one lock per open-to-closed transition while prevention is active and the option is on; verify no app-requested lock with the option off or prevention off. Startup or enabling the option with an already-closed lid must not lock. Native macOS automatic-lock policy may still apply independently.

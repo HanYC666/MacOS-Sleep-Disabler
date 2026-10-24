@@ -20,7 +20,7 @@ Ram usage: 27.6 MB with all functions turned on.
 - **Dynamic State Saving**: Remembers exactly what your Mac's sleep settings were before disabling sleep, and perfectly restores them when re-enabled.
 - **Battery Failsafe**: Let's you set a custom battery percentage (like 5%). If the battery drops below this while sleep is disabled, the app saves your Mac by forcing it to sleep and dropping a notification window.
 - **Lid-Closed Dimmer**: When sleep is disabled, you can close your MacBook lid to drop the screen brightness completely to 0 (so it doesn't glow or waste power) while still keeping the Mac wide awake. Opening the lid brings your brightness right back!
-- **Lock Screen When Lid Closes (macOS source)**: A saved, optional switch in the native **Lid Behavior** group and menu-bar menu locks your MacBook only while sleep prevention is active. It defaults off. The GNOME equivalent defaults on and also controls manual Suspend/sleep-key redirection; see its platform guide for details.
+- **Lock Screen When Lid Closes (macOS)**: A saved, optional switch in the native **Lid Behavior** group and menu-bar menu locks your MacBook only while sleep prevention is active. It defaults off. The GNOME equivalent defaults on and also controls manual Suspend/sleep-key redirection; see its platform guide for details.
 - **Sleep Scheduler**: Set a days, hours, and minutes countdown to put your Mac to sleep. The last duration and its safety options are saved, and menu-bar mode provides a quick start action plus a live remaining-time display.
 
 ## Requirements
@@ -33,7 +33,7 @@ Ram usage: 27.6 MB with all functions turned on.
 
 Download `Sleep-Disabler-arm64.zip` for Apple Silicon or `Sleep-Disabler-x86_64.zip` for Intel. Each archive contains a separate native `.app`; neither is a universal binary.
 
-Extract the matching archive and copy its app into Applications. When upgrading, quit the previous app before replacing it. The new macOS lid-lock feature is currently a source change: existing ZIPs have not been rebuilt. For this feature, build the current source using the [compile guide](macOS/compile.md), then follow the [macOS setup instructions](macOS/README.md#install). GNOME users should follow the [Linux guide](linux/gnome-wayland/README.md#install-on-the-gnome-wayland-machine).
+Extract the matching archive and copy `Sleep Disabler.app` into Applications. When upgrading, quit the previous app before replacing it. Both macOS ZIPs have been rebuilt with the optional lid-lock feature. See the [macOS setup instructions](macOS/README.md#install) or the [compile guide](macOS/compile.md) to build from source. GNOME users should follow the [Linux guide](linux/gnome-wayland/README.md#install-on-the-gnome-wayland-machine).
 
 On the first launch, the app opens in Window Mode. This makes it easier to find, especially on MacBook Pro where a menu bar icon could be hidden near the camera notch.
 

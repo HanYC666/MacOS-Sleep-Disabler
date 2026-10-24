@@ -4,10 +4,16 @@ All notable changes to Sleep Disabler are documented here. Versions without an e
 
 ## Unreleased
 
+### Added
+
 - Added a saved, optional **Lock Screen When Lid Closes** setting for MacBooks, active only while sleep prevention is on, with a matching checked menu-bar item.
+- Added isolated Swift lid-transition tests covering 30 policy checks without calling system locking or sleep APIs.
+
+### Changed
+
 - Grouped locking and dimming in a native **Lid Behavior** settings group with descriptive captions, system icons, and switches. The window scrolls to keep all settings accessible.
 - Reused IOKit lid monitoring independently of brightness support and guarded locking against startup, unreadable readings, repeated closed-lid events, and preference or prevention changes.
-- Added isolated Swift lid-transition tests and included the policy in native archives. macOS build, visual review, and hardware validation remain required before rebuilding release ZIPs.
+- Included the lid-lock policy in native archives and rebuilt the separate Apple Silicon and Intel ZIPs with bundles named `Sleep Disabler.app` using Xcode Command Line Tools.
 
 ## [2026-09-15] - 1.4.3
 

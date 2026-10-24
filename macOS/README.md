@@ -31,7 +31,7 @@ Ram usage: 27.6 MB with all functions turned on.
 
 Download `Sleep-Disabler-arm64.zip` for Apple Silicon or `Sleep-Disabler-x86_64.zip` for Intel. Each archive contains a separate native `.app`; neither is a universal binary.
 
-Extract the matching archive and copy the app into Applications. For an upgrade, quit the existing app before replacing it, and keep its preferences so saved settings remain available. Copying an app does not launch it; open it when ready to use it. The new lid-lock feature is currently available in source only; existing release ZIPs have not been rebuilt. Follow [compile.md](compile.md) to build it, then copy the matching app from `build/native-archives` into Applications.
+Extract the matching archive and copy `Sleep Disabler.app` into Applications. For an upgrade, quit the existing app before replacing it, and keep its preferences so saved settings remain available. Copying an app does not launch it; open it when ready to use it. Both ZIPs have been rebuilt with the optional lid-lock feature. Follow [compile.md](compile.md) to build from source, then copy the matching app from `build/native-archives` into Applications.
 
 On the first launch, the app opens in Window Mode. This makes it easier to find, especially on MacBook Pro where a menu bar icon could be hidden near the camera notch.
 
@@ -105,7 +105,7 @@ For the **Lid-Closed Dimmer**, the app reads `AppleClamshellState` directly thro
 
 **Lock Screen When Lid Closes** shares that lid monitor but works independently of brightness control. It requests a lock only on an observed open-to-closed transition while prevention and the option are both on. Startup, enabling the option with an already-closed lid, unreadable sensor data, and repeated closed readings do not trigger locks. Locking uses the dynamically resolved private `SACLockScreenImmediate` function in `login.framework`, also used by [Hammerspoon](https://github.com/Hammerspoon/hammerspoon/blob/master/extensions/caffeinate/libcaffeinate.m). The switch is unavailable if lid monitoring or the symbol is unavailable; private APIs may change between macOS releases. This setting does not intercept manual Sleep actions on macOS.
 
-Run `zsh Scripts/test-lid-lock.sh` from the macOS directory with Swift installed to exercise the standalone transition policy. These tests do not link screen-lock or power-management APIs. A native build and a real MacBook check are still needed to validate system locking and appearance; existing ZIP downloads are not rebuilt by source changes.
+Run `zsh Scripts/test-lid-lock.sh` from the macOS directory with Swift installed to exercise the standalone transition policy. These tests do not link screen-lock or power-management APIs. Both native architectures compiled successfully, and all 30 policy checks passed. The maintainer also completed manual testing of all app functionality and confirmed it works correctly. Source changes require rebuilding apps and ZIPs before distribution.
 
 The **Sleep Scheduler** uses the selected days, hours, and minutes as a countdown and then runs `pmset sleepnow`. Its saved values are restored at launch, so the menu-bar quick start always uses the last configured schedule. While a schedule is active, the menu displays the live remaining time. The optional closed-lid condition prevents starting while the lid is open and cancels the schedule if the lid opens. The optional sleep-disabled condition only permits a schedule while Sleep Disabler is active, and cancels it when normal sleep is restored.
 
