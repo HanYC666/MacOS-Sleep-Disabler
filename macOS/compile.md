@@ -31,4 +31,6 @@ The script uses an installed development certificate when available, otherwise i
 
 The scheduled-sleep warning links Apple's `UserNotifications` framework; the archive script includes it. After building, allow notifications when starting a timer and select Banners for Sleep Disabler in System Settings → Notifications. Check final-minute delivery and timer cancellation as described in [RELEASE.md](RELEASE.md). Existing repository ZIPs do not yet include this source change.
 
+Native compilation also includes `Sleep Disabler/BatteryFailsafePolicy.swift` for low-battery episode tracking and final dispatch validation. Its isolated regression checks are in `Tests/BatteryFailsafePolicyTests.swift`; compile these two files together to run the policy without invoking system power APIs.
+
 If output files already exist, pass a new directory, such as `zsh Scripts/archive-native.sh build/lid-lock-review`. A source update does not update previously generated apps or ZIPs. After launching a new build, the optional locking switch appears under **Lid Behavior** and in the menu-bar menu; it defaults off and operates only while sleep prevention is active.

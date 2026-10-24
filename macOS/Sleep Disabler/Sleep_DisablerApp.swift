@@ -148,6 +148,7 @@ final class AppState: ObservableObject {
     @Published var failsafeEnabled = false {
         didSet {
             UserDefaults.standard.set(failsafeEnabled, forKey: "failsafeEnabled")
+            batteryFailsafePolicy.reset()
             if failsafeEnabled { checkBatteryFailsafe() }
         }
     }
@@ -155,6 +156,7 @@ final class AppState: ObservableObject {
     @Published var failsafeThreshold: Int = 20 {
         didSet {
             UserDefaults.standard.set(failsafeThreshold, forKey: "failsafeThreshold")
+            batteryFailsafePolicy.reset()
             if failsafeEnabled { checkBatteryFailsafe() }
         }
     }
@@ -233,6 +235,7 @@ final class AppState: ObservableObject {
     private var lidInterestSource: CFRunLoopSource?
     private var workspaceObservers: [NSObjectProtocol] = []
     private var batteryNotificationSource: CFRunLoopSource?
+    private var batteryFailsafePolicy = BatteryFailsafePolicy()
     private var sleepTimer: Timer?
     private var sleepTimerEndDate: Date?
     private var sleepTimerWarningSent = false
@@ -724,9 +727,12 @@ final class AppState: ObservableObject {
     func checkBatteryFailsafe() {
         let status = currentBatteryStatus()
         supportsBatteryFailsafe = status.hasInternalBattery
-        guard failsafeEnabled, isFullySleepDisabled, status.isDrawingFromBattery,
-              let percentage = status.percentage, percentage < failsafeThreshold else { return }
-        triggerFailsafe()
+        guard let generation = batteryFailsafePolicy.consume(
+            enabled: failsafeEnabled, preventionActive: isFullySleepDisabled,
+            onBattery: status.isDrawingFromBattery, percentage: status.percentage,
+            threshold: failsafeThreshold
+        ) else { return }
+        triggerFailsafe(generation: generation)
     }
 
     private func installBatteryNotifications() {
@@ -742,10 +748,10 @@ final class AppState: ObservableObject {
         checkBatteryFailsafe()
     }
 
-    private func currentBatteryStatus() -> (hasInternalBattery: Bool, percentage: Int?, isDrawingFromBattery: Bool) {
+    private func currentBatteryStatus() -> (hasInternalBattery: Bool, percentage: Int?, isDrawingFromBattery: Bool?) {
         guard let snapshot = IOPSCopyPowerSourcesInfo()?.takeRetainedValue(),
               let sources = IOPSCopyPowerSourcesList(snapshot)?.takeRetainedValue() as? [CFTypeRef] else {
-            return (false, nil, false)
+            return (false, nil, nil)
         }
 
         var percentage: Int?
@@ -764,14 +770,16 @@ final class AppState: ObservableObject {
         }
 
         let provider = IOPSGetProvidingPowerSourceType(snapshot).takeRetainedValue() as String
-        return (hasInternalBattery, percentage, provider == (kIOPSBatteryPowerValue as String))
+        let onBattery: Bool? = provider == (kIOPSBatteryPowerValue as String) ? true
+            : provider == (kIOPSACPowerValue as String) ? false : nil
+        return (hasInternalBattery, percentage, onBattery)
     }
 
-    func triggerFailsafe() {
+    private func triggerFailsafe(generation: Int) {
         DispatchQueue.main.async {
             self.showNotificationWindow()
         }
-        forceMacToSleep()
+        forceMacToSleep(failsafeGeneration: generation)
     }
 
     func showNotificationWindow() {
@@ -1002,12 +1010,26 @@ final class AppState: ObservableObject {
         return components.joined(separator: " ")
     }
 
-    private func forceMacToSleep() {
+    private func forceMacToSleep(failsafeGeneration: Int? = nil) {
         if isCurrentlyDimmed { restoreBrightness() }
         let needsRestore = isFullySleepDisabled
         if needsRestore { toggleSleep() }
 
         DispatchQueue.main.asyncAfter(deadline: .now() + (needsRestore ? 1.5 : 0)) {
+            if let generation = failsafeGeneration {
+                let status = self.currentBatteryStatus()
+                guard self.batteryFailsafePolicy.generation == generation,
+                      self.batteryFailsafePolicy.permitsDispatch(
+                        enabled: self.failsafeEnabled, onBattery: status.isDrawingFromBattery,
+                        percentage: status.percentage, threshold: self.failsafeThreshold
+                      ) else {
+                    self.batteryFailsafePolicy.observe(onBattery: status.isDrawingFromBattery,
+                                                       percentage: status.percentage,
+                                                       threshold: self.failsafeThreshold)
+                    self.notificationWindow?.orderOut(nil)
+                    return
+                }
+            }
             self.runCommand(["sleepnow"])
         }
     }

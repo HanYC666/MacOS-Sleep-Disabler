@@ -1,5 +1,7 @@
 # Sleep Disabler
 
+The current source prevents repeated battery-failsafe sleep within one low-battery episode, including after resume or re-enabling prevention. Confirmed AC power, battery recovery above the threshold, or changing failsafe settings rearms it. It also checks power again immediately before sending the sleep command. This protection lasts for the app process; restarting the app starts a new episode. Existing ZIPs do not yet include this fix.
+
 Scheduled sleep sends a **Sleep Disabler — 1 minute until sleep** system notification once in the final minute. Allow notifications when first starting a timer and select Banners in macOS notification settings; Focus and system settings can suppress presentation. Cancel the timer in the app to keep working. Critical-battery failsafe sleep remains immediate, even during activity. This warning requires a new source build; the existing ZIPs have not been rebuilt with it.
 
 The most lightweight macOS app that lets you quickly stop your Mac from sleeping or turning off its display.

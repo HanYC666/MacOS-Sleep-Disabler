@@ -2,7 +2,17 @@
 
 Significant changes to Sleep Disabler for macOS and Linux are listed newest first. Dates follow Git author dates. Each entry identifies its commit where available; related audit-only follow-ups are grouped where noted. Version labels mark historical releases or designated milestones, not every commit. The v1.4.4 and v1.4.5 milestones are assigned retrospectively here; this does not create Git tags or change application metadata.
 
+## [2026-10-24] - macOS battery failsafe repeat protection
+
+### Fixed
+
+- Prevented repeated battery-failsafe sleep during the same low-battery episode after waking or re-enabling prevention. Confirmed AC power, recovery above the threshold, or explicit failsafe settings changes rearm the policy; unknown readings do not.
+- Rechecked power and failsafe settings immediately before delayed failsafe sleep, canceling the request when its conditions are no longer confirmed. Scheduled sleep is unchanged.
+- Added isolated episode and dispatch policy regression checks. This fix is source-only; existing ZIPs have not been rebuilt.
+
 ## [2026-10-24] - Scheduled-sleep warnings
+
+Commit: `8f5e647`
 
 ### Added
 
