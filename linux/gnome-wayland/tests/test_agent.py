@@ -106,6 +106,35 @@ class FakeBrightness:
 
 
 class AgentTests(unittest.TestCase):
+    def test_timer_warns_once_in_final_minute(self):
+        a = self.agent
+        a.deadline = 120
+        for now in (59, 60, 61, 119):
+            boot, mono = self.clock(now, now)
+            with boot, mono:
+                self.assertTrue(a.tick())
+            self.assertEqual(a.notify.call_count, 0 if now == 59 else 1)
+        self.assertIn('Sleep Disabler', a.notify.call_args.args[0])
+        self.assertIn('1 minute left', a.notify.call_args.args[1])
+
+    def test_canceled_or_expired_timer_does_not_warn(self):
+        a = self.agent
+        a.deadline = 60
+        a.require_lid = True
+        a.lid_closed = False
+        boot, mono = self.clock(1, 1)
+        with boot, mono:
+            a.tick()
+        a.notify.assert_not_called()
+        a.deadline = 60
+        a.require_lid = False
+        a.sleep_now = mock.Mock()
+        boot, mono = self.clock(60, 60)
+        with boot, mono:
+            a.tick()
+        a.notify.assert_not_called()
+        a.sleep_now.assert_called_once_with('Countdown elapsed')
+
     def test_lock_preference_defaults_validation_and_persistence(self):
         a = self.agent
         self.assertTrue(a.validate_settings({})['lock_on_lid_close'])
@@ -825,6 +854,7 @@ class AgentTests(unittest.TestCase):
         a.require_lid = False
         a.require_prevention = False
         a.last_timer_state = -1
+        a.timer_warning_sent = False
         a.clock_gap = agent_module.ClockGapSample(0, 0, 0, 0)
         a.logind_owner_generation = 0
         a.last_prepare_signal = None

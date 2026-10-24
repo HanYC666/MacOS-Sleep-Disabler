@@ -314,6 +314,7 @@ class Agent(dbus.service.Object):
         self.last_timer_require_lid = False
         self.last_timer_require_prevention = False
         self.deadline = None
+        self.timer_warning_sent = False
         self.require_lid = False
         self.require_prevention = False
         self.last_error = ""
@@ -3757,6 +3758,11 @@ class Agent(dbus.service.Object):
                 self.sleep_now("Countdown elapsed")
             else:
                 remaining = math.ceil(self.deadline - now)
+                if remaining <= 60 and not self.timer_warning_sent:
+                    self.timer_warning_sent = True
+                    self.notify('Sleep Disabler — 1 minute until sleep',
+                                'Your sleep timer has 1 minute left. Save your work or '
+                                'cancel the timer in Sleep Disabler to keep using this computer.')
                 displayed_minute = math.ceil(remaining / 60)
                 if displayed_minute != self.last_timer_state:
                     self.last_timer_state = displayed_minute
@@ -4953,6 +4959,7 @@ class Agent(dbus.service.Object):
                 if time.monotonic() >= operation['deadline']:
                     raise TimeoutError('Timer start exceeded its deadline')
                 self.deadline = boottime() + seconds
+                self.timer_warning_sent = False
                 fresh_sample = sample_clock_gap()
                 self.retain_clock_baseline(fresh_sample)
                 self.timer_phase = 'running'

@@ -1,5 +1,7 @@
 # Sleep Disabler
 
+Current source adds a system notification from **Sleep Disabler** when a scheduled sleep timer has one minute left on macOS and Linux. Notification permissions and desktop settings control banner visibility. Cancel the timer to keep working; critical-battery failsafe sleep remains immediate. The macOS ZIPs have not yet been rebuilt with this warning.
+
 See the shared [changelog](CHANGELOG.md) for dated macOS and Linux development history.
 
 Choose the instructions for your platform: [macOS installation and settings](macOS/README.md) or the experimental [GNOME Wayland installation](linux/gnome-wayland/README.md). The macOS source is in `macOS/`; GNOME Wayland uses a separate agent and Shell extension.

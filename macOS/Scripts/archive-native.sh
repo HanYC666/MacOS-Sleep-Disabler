@@ -109,6 +109,7 @@ archive_one() {
     -framework AppKit \
     -framework IOKit \
     -framework ServiceManagement \
+    -framework UserNotifications \
     "${source_files[@]}" \
     -o "${release_app}/Contents/MacOS/Sleep Disabler"
 

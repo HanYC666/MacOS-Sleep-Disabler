@@ -38,6 +38,8 @@ its requested architecture.
 
 ## Lid-lock release validation
 
+The newer scheduled-sleep warning is currently source-only; the repository ZIPs still contain the previously validated v1.4.5 archive build. The warning source passed arm64 and Intel type checking, but banner delivery has not been manually verified. Before distributing it, rebuild both architectures and test a two-minute timer: allow notification permission, confirm one Sleep Disabler warning in the final minute in foreground and menu-bar mode, then cancel the timer before expiry. Also check a one-minute timer and denied notifications. macOS notification style and Focus settings control visibility; the warning does not postpone sleep or alter the immediate battery failsafe.
+
 Both repository ZIPs have been rebuilt with the lid-lock implementation using Xcode Command Line Tools. The builds passed single-architecture and local ad-hoc signature verification, and all 30 isolated policy checks passed. The maintainer completed manual testing of all app functionality and confirmed it works correctly. This archive update is recorded as v1.4.5 in the shared [changelog](../CHANGELOG.md).
 
 Use the following checklist for subsequent releases:

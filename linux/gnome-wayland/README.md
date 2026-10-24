@@ -1,5 +1,7 @@
 # GNOME Wayland prototype
 
+Scheduled sleep sends a **Sleep Disabler — 1 minute until sleep** desktop notification once in the final minute. Save your work or cancel the timer using the panel or `sleep-disablerctl cancel-timer`. GNOME notification and Do Not Disturb settings control banner visibility. Critical-battery failsafe sleep remains immediate; user activity does not postpone it.
+
 This is a prototype of Sleep Disabler for GNOME Wayland on Debian-family distributions. It uses a per-user Python agent, a GNOME Shell extension, and an administrator-installed read-only system sleep guard. The current source identifies agent runtime `0.7.1`, D-Bus API `7`, and panel runtime/metadata `8`; the user installer requires these exact active versions. The agent starts with sleep prevention **off** on every fresh process start. It does not edit `logind.conf` or kernel sleep state. By default, sleep prevention redirects GNOME sleep, hibernate, and power shortcuts to screen lock; the panel can disable this locking behavior while retaining prevention. Prior shortcut settings are restored on release. Automated tests use fake buses/settings or harmless service markers. Actual suspend and hardware behavior remain unverified.
 
 ## Install on the GNOME Wayland machine

@@ -29,4 +29,6 @@ open "build/native-archives/Sleep-Disabler-x86_64.app"
 
 The script uses an installed development certificate when available, otherwise it creates an ad-hoc signature for local use. See [RELEASE.md](RELEASE.md) for Developer ID notarization.
 
+The scheduled-sleep warning links Apple's `UserNotifications` framework; the archive script includes it. After building, allow notifications when starting a timer and select Banners for Sleep Disabler in System Settings → Notifications. Check final-minute delivery and timer cancellation as described in [RELEASE.md](RELEASE.md). Existing repository ZIPs do not yet include this source change.
+
 If output files already exist, pass a new directory, such as `zsh Scripts/archive-native.sh build/lid-lock-review`. A source update does not update previously generated apps or ZIPs. After launching a new build, the optional locking switch appears under **Lid Behavior** and in the menu-bar menu; it defaults off and operates only while sleep prevention is active.

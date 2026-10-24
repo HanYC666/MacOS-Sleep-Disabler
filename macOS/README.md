@@ -1,5 +1,7 @@
 # Sleep Disabler
 
+Scheduled sleep sends a **Sleep Disabler — 1 minute until sleep** system notification once in the final minute. Allow notifications when first starting a timer and select Banners in macOS notification settings; Focus and system settings can suppress presentation. Cancel the timer in the app to keep working. Critical-battery failsafe sleep remains immediate, even during activity. This warning requires a new source build; the existing ZIPs have not been rebuilt with it.
+
 The most lightweight macOS app that lets you quickly stop your Mac from sleeping or turning off its display.
 
 It is written in SwiftUI and can run either as a normal window or as a menu bar app. It is useful for long-running downloads, scripts, builds, or agentic tasks where the Mac needs to stay awake.

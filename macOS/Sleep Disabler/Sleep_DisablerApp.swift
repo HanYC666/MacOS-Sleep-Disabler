@@ -10,6 +10,7 @@ import Combine
 import Darwin
 import IOKit
 import IOKit.ps
+import UserNotifications
 
 // DisplayServices is private, so resolve the optional brightness functions at
 // runtime. A missing symbol disables only the lid dimmer and never prevents the
@@ -234,6 +235,7 @@ final class AppState: ObservableObject {
     private var batteryNotificationSource: CFRunLoopSource?
     private var sleepTimer: Timer?
     private var sleepTimerEndDate: Date?
+    private var sleepTimerWarningSent = false
     private weak var sleepSchedulerRemainingMenuItem: NSMenuItem?
 
     var hasSleepTimerDuration: Bool { sleepTimerDuration > 0 }
@@ -942,6 +944,9 @@ final class AppState: ObservableObject {
         }
 
         stopSleepTimer()
+        UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { _, error in
+            if let error { print("Sleep warning authorization: \(error)") }
+        }
         sleepTimerEndDate = Date().addingTimeInterval(sleepTimerDuration)
         updateSleepTimerRemaining()
         let timer = Timer(timeInterval: 1, repeats: true) { [weak self] _ in
@@ -956,6 +961,10 @@ final class AppState: ObservableObject {
         sleepTimer?.invalidate()
         sleepTimer = nil
         sleepTimerEndDate = nil
+        sleepTimerWarningSent = false
+        let center = UNUserNotificationCenter.current()
+        center.removePendingNotificationRequests(withIdentifiers: ["sleep-timer-warning"])
+        center.removeDeliveredNotifications(withIdentifiers: ["sleep-timer-warning"])
         sleepTimerRemaining = 0
         refreshMenuBar()
     }
@@ -967,6 +976,18 @@ final class AppState: ObservableObject {
             sleepTimerRunning = false
             forceMacToSleep()
         } else {
+            if remaining <= 60 && !sleepTimerWarningSent {
+                sleepTimerWarningSent = true
+                let content = UNMutableNotificationContent()
+                content.title = "Sleep Disabler — 1 minute until sleep"
+                content.body = "Your sleep timer has 1 minute left. Save your work or cancel the timer in Sleep Disabler to keep using this Mac."
+                content.sound = .default
+                UNUserNotificationCenter.current().add(UNNotificationRequest(
+                    identifier: "sleep-timer-warning", content: content, trigger: nil
+                )) { error in
+                    if let error { print("Sleep warning delivery: \(error)") }
+                }
+            }
             sleepTimerRemaining = remaining
             sleepSchedulerRemainingMenuItem?.title = "Sleep Scheduler: \(sleepTimerRemainingText) remaining"
         }
@@ -1051,11 +1072,12 @@ private enum PmsetPermissionStatus {
     case missing
 }
 
-final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
+final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, UNUserNotificationCenterDelegate {
     weak var mainWindow: NSWindow?
     weak var appState: AppState?
 
     func applicationWillFinishLaunching(_ notification: Notification) {
+        UNUserNotificationCenter.current().delegate = self
         let startsInMenuBarMode = UserDefaults.standard.object(forKey: "menuBarMode") as? Bool ?? false
         NSApp.setActivationPolicy(startsInMenuBarMode ? .accessory : .regular)
     }
@@ -1064,6 +1086,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         DispatchQueue.main.async {
             self.checkPmsetPermission()
         }
+    }
+
+    func userNotificationCenter(_ center: UNUserNotificationCenter,
+                                willPresent notification: UNNotification,
+                                withCompletionHandler completionHandler: @escaping (UNNotificationPresentationOptions) -> Void) {
+        completionHandler([.banner, .sound])
     }
 
     func applicationWillTerminate(_ notification: Notification) {

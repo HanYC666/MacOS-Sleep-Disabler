@@ -1,6 +1,14 @@
 # Changelog
 
-Significant changes to Sleep Disabler for macOS and Linux are listed newest first. Dates follow Git author dates. Each entry identifies its commit; related audit-only follow-ups are grouped where noted. Version labels mark historical releases or designated milestones, not every commit. The v1.4.4 and v1.4.5 milestones are assigned retrospectively here; this does not create Git tags or change application metadata.
+Significant changes to Sleep Disabler for macOS and Linux are listed newest first. Dates follow Git author dates. Each entry identifies its commit where available; related audit-only follow-ups are grouped where noted. Version labels mark historical releases or designated milestones, not every commit. The v1.4.4 and v1.4.5 milestones are assigned retrospectively here; this does not create Git tags or change application metadata.
+
+## [2026-10-24] - Scheduled-sleep warnings
+
+### Added
+
+- Added a one-minute scheduled-sleep warning identifying Sleep Disabler on macOS and Linux, delivered once per countdown through system notifications.
+- Requested macOS notification permission when starting a timer and enabled foreground banner presentation. System notification settings still control visibility; critical-battery sleep remains immediate.
+- Added Linux regression tests for warning timing, duplicate suppression, cancellation, and expired timers. All 227 agent tests passed; macOS source passed arm64 and Intel type checking. Banner delivery still requires desktop validation, and the existing macOS ZIPs do not contain this change.
 
 ## [2026-10-24] - v1.4.5 - Native macOS archives
 
