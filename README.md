@@ -1,5 +1,7 @@
 # Sleep Disabler
 
+See the shared [changelog](CHANGELOG.md) for dated macOS and Linux development history.
+
 Choose the instructions for your platform: [macOS installation and settings](macOS/README.md) or the experimental [GNOME Wayland installation](linux/gnome-wayland/README.md). The macOS source is in `macOS/`; GNOME Wayland uses a separate agent and Shell extension.
 
 The most lightweight macOS app that lets you quickly stop your Mac from sleeping or turning off its display.

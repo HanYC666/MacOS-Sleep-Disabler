@@ -38,7 +38,7 @@ its requested architecture.
 
 ## Lid-lock release validation
 
-Both repository ZIPs have been rebuilt with the lid-lock implementation using Xcode Command Line Tools. The builds passed single-architecture and local ad-hoc signature verification, and all 30 isolated policy checks passed. The maintainer completed manual testing of all app functionality and confirmed it works correctly. The changelog entry remains unreleased until a release is designated.
+Both repository ZIPs have been rebuilt with the lid-lock implementation using Xcode Command Line Tools. The builds passed single-architecture and local ad-hoc signature verification, and all 30 isolated policy checks passed. The maintainer completed manual testing of all app functionality and confirmed it works correctly. This archive update is recorded as v1.4.5 in the shared [changelog](../CHANGELOG.md).
 
 Use the following checklist for subsequent releases:
 
