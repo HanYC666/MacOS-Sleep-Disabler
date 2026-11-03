@@ -2,6 +2,18 @@
 
 Significant changes to Sleep Disabler for macOS and Linux are listed newest first. Dates follow Git author dates. Each entry identifies its commit where available; related audit-only follow-ups are grouped where noted. Version labels mark historical releases or designated milestones, not every commit. The v1.4.4 and v1.4.5 milestones are assigned retrospectively here; this does not create Git tags or change application metadata.
 
+## [2026-11-03] - macOS window and lid-dimmer repair
+
+### Fixed
+
+- Created the main window only when Window Mode or **Show Window** requests it, avoiding an invisible startup window in Menu Bar mode and reusing the same window after closing it.
+- Saved the built-in display brightness while the lid is open, then restored that value after reopening; kept the display ID across lid closure and retried restoration when the display is available.
+- Made the isolated lid-lock test script use Xcode Command Line Tools and a writable temporary module cache.
+
+### Changed
+
+- Rebuilt and repackaged separate arm64 and x86_64 macOS ZIPs with the earlier scheduled-sleep warning and battery-failsafe repeat protection included. Both apps use local ad-hoc signing; window and lid hardware behavior still needs attended verification.
+
 ## [2026-10-24] - macOS battery failsafe repeat protection
 
 ### Fixed

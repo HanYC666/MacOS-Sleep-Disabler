@@ -1,8 +1,8 @@
 # Sleep Disabler
 
-Current source adds a system notification from **Sleep Disabler** when a scheduled sleep timer has one minute left on macOS and Linux. Notification permissions and desktop settings control banner visibility. Cancel the timer to keep working; critical-battery failsafe sleep remains immediate. The macOS ZIPs have not yet been rebuilt with this warning.
+The current macOS archives include a **Sleep Disabler** system notification when a scheduled sleep timer has one minute left. Notification permissions and desktop settings control banner visibility. Cancel the timer to keep working; critical-battery failsafe sleep remains immediate. Linux also provides this warning.
 
-The macOS source also prevents repeated failsafe sleep during one low-battery episode and rechecks power immediately before sleep, canceling if AC power is detected or battery conditions are no longer confirmed. Episode tracking lasts for the app process and resets after confirmed AC, recovery above the threshold, or explicit failsafe settings changes. Existing ZIPs do not yet include this fix; see the [macOS guide](macOS/README.md).
+The macOS archives also prevent repeated failsafe sleep during one low-battery episode and recheck power immediately before sleep, canceling if AC power is detected or battery conditions are no longer confirmed. Episode tracking lasts for the app process and resets after confirmed AC, recovery above the threshold, or explicit failsafe settings changes. See the [macOS guide](macOS/README.md).
 
 See the shared [changelog](CHANGELOG.md) for dated macOS and Linux development history.
 
@@ -25,7 +25,7 @@ Ram usage: 27.6 MB with all functions turned on.
 - Read battery percentage and the active power source through IOKit instead of parsing `pmset` text.
 - **Dynamic State Saving**: Remembers exactly what your Mac's sleep settings were before disabling sleep, and perfectly restores them when re-enabled.
 - **Battery Failsafe**: Let's you set a custom battery percentage (like 5%). If the battery drops below this while sleep is disabled, the app saves your Mac by forcing it to sleep and dropping a notification window.
-- **Lid-Closed Dimmer**: When sleep is disabled, you can close your MacBook lid to drop the screen brightness completely to 0 (so it doesn't glow or waste power) while still keeping the Mac wide awake. Opening the lid brings your brightness right back!
+- **Lid-Closed Dimmer**: When sleep is disabled, closing a MacBook lid sets its built-in display brightness to 0. The app saves the brightness while the lid is open and restores that value when it opens again.
 - **Lock Screen When Lid Closes (macOS)**: A saved, optional switch in the native **Lid Behavior** group and menu-bar menu locks your MacBook only while sleep prevention is active. It defaults off. The GNOME equivalent defaults on and also controls manual Suspend/sleep-key redirection; see its platform guide for details.
 - **Sleep Scheduler**: Set a days, hours, and minutes countdown to put your Mac to sleep. The last duration and its safety options are saved, and menu-bar mode provides a quick start action plus a live remaining-time display.
 
@@ -39,9 +39,9 @@ Ram usage: 27.6 MB with all functions turned on.
 
 Download `Sleep-Disabler-arm64.zip` for Apple Silicon or `Sleep-Disabler-x86_64.zip` for Intel. Each archive contains a separate native `.app`; neither is a universal binary.
 
-Extract the matching archive and copy `Sleep Disabler.app` into Applications. When upgrading, quit the previous app before replacing it. Both macOS ZIPs have been rebuilt with the optional lid-lock feature. See the [macOS setup instructions](macOS/README.md#install) or the [compile guide](macOS/compile.md) to build from source. GNOME users should follow the [Linux guide](linux/gnome-wayland/README.md#install-on-the-gnome-wayland-machine).
+Extract the matching archive and copy `Sleep Disabler.app` into Applications. When upgrading, quit the previous app before replacing it. Both macOS ZIPs include the scheduled-sleep warning, battery-failsafe repeat protection, optional lid locking, and the window and brightness fixes. See the [macOS setup instructions](macOS/README.md#install) or the [compile guide](macOS/compile.md) to build from source. GNOME users should follow the [Linux guide](linux/gnome-wayland/README.md#install-on-the-gnome-wayland-machine).
 
-On the first launch, the app opens in Window Mode. This makes it easier to find, especially on MacBook Pro where a menu bar icon could be hidden near the camera notch.
+On the first launch, the app opens in Window Mode. Later launches use the saved mode. Menu Bar mode creates the main window only when you choose **Show Window** or switch to Window Mode.
 
 ## Permissions
 

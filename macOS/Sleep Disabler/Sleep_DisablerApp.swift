@@ -51,70 +51,17 @@ private enum MacScreenLock {
 @main
 struct SleepToggleApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) var appDelegate
-    @StateObject var appState = AppState()
 
     var body: some Scene {
-        WindowGroup(id: "main") {
-            MainWindowRoot(appState: appState, appDelegate: appDelegate)
+        Settings {
+            EmptyView()
         }
-        .commands {
-            CommandGroup(replacing: .newItem) {}
-        }
-    }
-}
-
-private struct MainWindowRoot: View {
-    @Environment(\.openWindow) private var openWindow
-    @ObservedObject var appState: AppState
-    let appDelegate: AppDelegate
-
-    var body: some View {
-        MainView()
-            .environmentObject(appState)
-            .background(WindowAccessor { window in
-                appDelegate.mainWindow = window
-                appDelegate.appState = appState
-                window.delegate = appDelegate
-                window.isReleasedWhenClosed = false
-                appState.configureInitialWindow(window)
-            })
-            .onAppear {
-                appState.setMainWindowOpener {
-                    openWindow(id: "main")
-                }
-            }
-    }
-}
-
-// MARK: - WINDOW ACCESSOR
-struct WindowAccessor: NSViewRepresentable {
-    var callback: (NSWindow) -> Void
-
-    func makeNSView(context: Context) -> NSView {
-        WindowObservationView(callback: callback)
-    }
-
-    func updateNSView(_ nsView: NSView, context: Context) {}
-}
-
-private final class WindowObservationView: NSView {
-    private let callback: (NSWindow) -> Void
-
-    init(callback: @escaping (NSWindow) -> Void) {
-        self.callback = callback
-        super.init(frame: .zero)
-    }
-
-    required init?(coder: NSCoder) { nil }
-
-    override func viewDidMoveToWindow() {
-        super.viewDidMoveToWindow()
-        if let window { callback(window) }
     }
 }
 
 // MARK: - APP STATE
 final class AppState: ObservableObject {
+    static let shared = AppState()
     private static let preferencesApplicationID = "com.ych.sleepdisabler" as CFString
     private static let lidDimmerPreferenceKey = "lidDimmerEnabled" as CFString
     private static let lidLockPreferenceKey = "lockOnLidClose" as CFString
@@ -225,6 +172,7 @@ final class AppState: ObservableObject {
 
     // Dimmer state
     private var originalBrightness: Float? = nil
+    private var brightnessDisplay: CGDirectDisplayID?
     private var isCurrentlyDimmed = false
     private var lidCheckTimer: Timer?
     private var supportsLidMonitoring = false
@@ -261,9 +209,6 @@ final class AppState: ObservableObject {
 
     // Notification Window
     private var mainWindow: NSWindow?
-    private var openMainWindowAction: (() -> Void)?
-    private var isOpeningMainWindow = false
-    private var shouldRevealNextMainWindow = false
     private var notificationWindow: NSWindow?
 
     init() {
@@ -292,9 +237,6 @@ final class AppState: ObservableObject {
 
         if menuBarMode {
             createMenuBar()
-            DispatchQueue.main.async {
-                self.hideAllWindows()
-            }
         }
 
         startRefreshTimer()
@@ -346,33 +288,6 @@ final class AppState: ObservableObject {
                 CFRunLoopRemoveSource(CFRunLoopGetMain(), lidInterestSource, .commonModes)
             }
             IONotificationPortDestroy(lidNotificationPort)
-        }
-    }
-
-    func configureInitialWindow(_ window: NSWindow) {
-        mainWindow = window
-        isOpeningMainWindow = false
-        let shouldReveal = shouldRevealNextMainWindow
-        shouldRevealNextMainWindow = false
-        window.setContentSize(NSSize(width: 440, height: 740))
-        window.collectionBehavior.insert(.moveToActiveSpace)
-        if menuBarMode && !shouldReveal {
-            window.alphaValue = 0
-            window.animationBehavior = .none
-            window.orderOut(nil)
-        } else {
-            window.alphaValue = 1
-        }
-    }
-
-    func setMainWindowOpener(_ action: @escaping () -> Void) {
-        openMainWindowAction = action
-    }
-
-    func mainWindowWillClose(_ window: NSWindow) {
-        if let mainWindow, mainWindow === window {
-            self.mainWindow = nil
-            isOpeningMainWindow = false
         }
     }
 
@@ -432,25 +347,28 @@ final class AppState: ObservableObject {
 
     func showWindow() {
         updateActivationPolicy()
-        if let window = mainWindow {
-            NSApplication.shared.activate(ignoringOtherApps: true)
-            window.alphaValue = 1
-            window.animationBehavior = .default
-            if window.isMiniaturized {
-                window.deminiaturize(nil)
-            }
-            window.makeKeyAndOrderFront(nil)
-            window.orderFrontRegardless()
-            return
+        if mainWindow == nil {
+            let window = NSWindow(
+                contentRect: NSRect(x: 0, y: 0, width: 440, height: 740),
+                styleMask: [.titled, .closable, .miniaturizable, .resizable],
+                backing: .buffered,
+                defer: false
+            )
+            window.title = "Sleep Disabler"
+            window.contentViewController = NSHostingController(rootView: MainView().environmentObject(self))
+            window.collectionBehavior.insert(.moveToActiveSpace)
+            window.isReleasedWhenClosed = false
+            window.delegate = NSApp.delegate as? AppDelegate
+            window.center()
+            mainWindow = window
         }
-
-        guard !isOpeningMainWindow, let openMainWindowAction else { return }
-        isOpeningMainWindow = true
-        shouldRevealNextMainWindow = true
-        openMainWindowAction()
-        DispatchQueue.main.async {
-            NSApplication.shared.activate(ignoringOtherApps: true)
+        guard let window = mainWindow else { return }
+        NSApp.activate(ignoringOtherApps: true)
+        if window.isMiniaturized {
+            window.deminiaturize(nil)
         }
+        window.makeKeyAndOrderFront(nil)
+        window.orderFrontRegardless()
     }
 
     func hideAllWindows() {
@@ -824,6 +742,10 @@ final class AppState: ObservableObject {
         // Unknown sensor data must not be interpreted as opening the lid.
         guard let isClosed = lidClosed else { return }
 
+        // The display may already report zero by the time a close event arrives.
+        // Keep the last brightness observed while the lid was open.
+        if !isClosed && !isCurrentlyDimmed { rememberOpenBrightness() }
+
         if sleepTimerRunning && sleepTimerLidClosedOnly && !isClosed {
             sleepTimerRunning = false
         }
@@ -834,6 +756,7 @@ final class AppState: ObservableObject {
             dimBrightness()
         } else if !isClosed && isCurrentlyDimmed {
             restoreBrightness()
+            if !isCurrentlyDimmed { rememberOpenBrightness() }
         }
     }
 
@@ -918,22 +841,37 @@ final class AppState: ObservableObject {
     }
 
     func dimBrightness() {
-        guard supportsLidDimmer, let getBrightness = DisplayBrightness.getBrightness,
+        guard supportsLidDimmer, originalBrightness != nil,
+              let display = brightnessDisplay,
               let setBrightness = DisplayBrightness.setBrightness else { return }
-        let display = CGMainDisplayID()
-        var current: Float = 0
-        guard getBrightness(display, &current) == 0 else { return }
         guard setBrightness(display, 0.0) == 0 else { return }
-        originalBrightness = current
         isCurrentlyDimmed = true
     }
 
     func restoreBrightness() {
-        if let orig = originalBrightness, let setBrightness = DisplayBrightness.setBrightness {
-            _ = setBrightness(CGMainDisplayID(), orig)
-        }
+        guard isCurrentlyDimmed, let orig = originalBrightness,
+              let display = builtInDisplay() ?? brightnessDisplay,
+              let setBrightness = DisplayBrightness.setBrightness,
+              setBrightness(display, orig) == 0 else { return }
         originalBrightness = nil
         isCurrentlyDimmed = false
+    }
+
+    private func rememberOpenBrightness() {
+        guard let display = builtInDisplay(),
+              let getBrightness = DisplayBrightness.getBrightness else { return }
+        var current: Float = 0
+        if getBrightness(display, &current) == 0 && current.isFinite && current > 0 {
+            brightnessDisplay = display
+            originalBrightness = current
+        }
+    }
+
+    private func builtInDisplay() -> CGDirectDisplayID? {
+        var displays = [CGDirectDisplayID](repeating: 0, count: 16)
+        var count: UInt32 = 0
+        guard CGGetOnlineDisplayList(UInt32(displays.count), &displays, &count) == .success else { return nil }
+        return displays.prefix(Int(count)).first { CGDisplayIsBuiltin($0) != 0 }
     }
 
     // MARK: - SLEEP TIMER
@@ -1095,7 +1033,6 @@ private enum PmsetPermissionStatus {
 }
 
 final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, UNUserNotificationCenterDelegate {
-    weak var mainWindow: NSWindow?
     weak var appState: AppState?
 
     func applicationWillFinishLaunching(_ notification: Notification) {
@@ -1105,6 +1042,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, UNUs
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        let state = AppState.shared
+        appState = state
+        if !state.menuBarMode { state.showWindow() }
         DispatchQueue.main.async {
             self.checkPmsetPermission()
         }
@@ -1129,14 +1069,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, UNUs
     func windowShouldClose(_ sender: NSWindow) -> Bool {
         appState?.updateActivationPolicy()
         return true
-    }
-
-    func windowWillClose(_ notification: Notification) {
-        guard let window = notification.object as? NSWindow else { return }
-        appState?.mainWindowWillClose(window)
-        if let mainWindow, mainWindow === window {
-            self.mainWindow = nil
-        }
     }
 
     func checkPmsetPermission() {
