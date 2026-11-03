@@ -49,13 +49,14 @@ private enum MacScreenLock {
 }
 
 @main
-struct SleepToggleApp: App {
-    @NSApplicationDelegateAdaptor(AppDelegate.self) var appDelegate
-
-    var body: some Scene {
-        Settings {
-            EmptyView()
-        }
+enum SleepToggleApp {
+    static func main() {
+        // No SwiftUI Scene: even an empty Settings scene can create a window.
+        let application = NSApplication.shared
+        let delegate = AppDelegate()
+        application.delegate = delegate
+        application.run()
+        withExtendedLifetime(delegate) {}
     }
 }
 
@@ -1042,12 +1043,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, UNUs
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        installMainMenu()
         let state = AppState.shared
         appState = state
         if !state.menuBarMode { state.showWindow() }
         DispatchQueue.main.async {
             self.checkPmsetPermission()
         }
+    }
+
+    private func installMainMenu() {
+        let menu = NSMenu()
+        let applicationItem = NSMenuItem(title: "Sleep Disabler", action: nil, keyEquivalent: "")
+        let applicationMenu = NSMenu(title: "Sleep Disabler")
+        applicationMenu.addItem(withTitle: "Quit Sleep Disabler", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
+        applicationItem.submenu = applicationMenu
+        menu.addItem(applicationItem)
+
+        let windowItem = NSMenuItem(title: "Window", action: nil, keyEquivalent: "")
+        let windowMenu = NSMenu(title: "Window")
+        windowMenu.addItem(withTitle: "Close Window", action: #selector(NSWindow.performClose(_:)), keyEquivalent: "w")
+        windowItem.submenu = windowMenu
+        menu.addItem(windowItem)
+        NSApp.mainMenu = menu
     }
 
     func userNotificationCenter(_ center: UNUserNotificationCenter,
@@ -1058,6 +1076,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, UNUs
 
     func applicationWillTerminate(_ notification: Notification) {
         appState?.restoreBrightness()
+    }
+
+    func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
+        false
     }
 
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {

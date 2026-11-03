@@ -6,7 +6,7 @@ Significant changes to Sleep Disabler for macOS and Linux are listed newest firs
 
 ### Fixed
 
-- Created the main window only when Window Mode or **Show Window** requests it, avoiding an invisible startup window in Menu Bar mode and reusing the same window after closing it.
+- Created the main window only when Window Mode or **Show Window** requests it, avoiding an invisible startup window in Menu Bar mode and reusing the same window after closing it. After an empty SwiftUI `Settings` scene caused a separate blank window, moved app launch to AppKit while continuing to host the existing SwiftUI controls in the requested window.
 - Saved the built-in display brightness while the lid is open, then restored that value after reopening; kept the display ID across lid closure and retried restoration when the display is available.
 - Made the isolated lid-lock test script use Xcode Command Line Tools and a writable temporary module cache.
 
