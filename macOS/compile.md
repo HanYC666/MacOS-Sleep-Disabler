@@ -8,14 +8,15 @@ This project builds with Apple's Xcode Command Line Tools only. The archive scri
 cd "/path/to/MacOS-Sleep-Disabler/macOS"
 ```
 
-2. Run the isolated lid-lock policy tests, then the archive script from that folder. Do not use `sudo` and do not run them from the `Scripts` folder:
+2. Run the isolated lid-lock and brightness policy tests, then the archive script from that folder. Do not use `sudo` and do not run them from the `Scripts` folder:
 
 ```bash
 zsh Scripts/test-lid-lock.sh
+zsh Scripts/test-lid-brightness.sh
 zsh Scripts/archive-native.sh
 ```
 
-The test executable contains only the transition policy: it cannot lock the screen or suspend the computer. It checks preference/prevention gating, startup, repeated closure, unknown lid readings, and baseline resets. This is separate from native UI and hardware validation. The archive includes `ContentView.swift`, `LidLockPolicy.swift`, `BatteryFailsafePolicy.swift`, and `Sleep_DisablerApp.swift`.
+The test executables contain only the lid policies: they cannot change brightness, lock the screen, or suspend the computer. They check repeated lid cycles, delayed brightness resets, restore failure, and lock-transition gating. This is separate from native UI and hardware validation. The archive includes `ContentView.swift`, `LidLockPolicy.swift`, `LidBrightnessPolicy.swift`, `BatteryFailsafePolicy.swift`, and `Sleep_DisablerApp.swift`.
 
 3. The script creates two independent native apps under `build/native-archives`. To install without launching, copy the matching app into Applications using Finder; quit an older copy before replacing it. To launch when ready, use only the app for your Mac:
 

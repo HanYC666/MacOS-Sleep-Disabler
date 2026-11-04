@@ -172,9 +172,8 @@ final class AppState: ObservableObject {
     private var isTogglingSleep = false
 
     // Dimmer state
-    private var originalBrightness: Float? = nil
-    private var brightnessDisplay: CGDirectDisplayID?
-    private var isCurrentlyDimmed = false
+    private var lidBrightnessPolicy = LidBrightnessPolicy()
+    private var brightnessRecoveryTimer: Timer?
     private var lidCheckTimer: Timer?
     private var supportsLidMonitoring = false
     private var lidLockPolicy = LidLockPolicy()
@@ -277,6 +276,7 @@ final class AppState: ObservableObject {
     deinit {
         refreshTimer?.invalidate()
         lidCheckTimer?.invalidate()
+        brightnessRecoveryTimer?.invalidate()
         sleepTimer?.invalidate()
         if let batteryNotificationSource {
             CFRunLoopRemoveSource(CFRunLoopGetMain(), batteryNotificationSource, .commonModes)
@@ -304,7 +304,8 @@ final class AppState: ObservableObject {
     func updateLidMonitoring() {
         let needsLidState = supportsLidMonitoring
             && ((supportsLidLock && lockOnLidClose && isFullySleepDisabled)
-                || lidDimmerEnabled || (sleepTimerRunning && sleepTimerLidClosedOnly))
+                || lidDimmerEnabled || lidBrightnessPolicy.isDimmed
+                || (sleepTimerRunning && sleepTimerLidClosedOnly))
         if needsLidState {
             if lidCheckTimer == nil {
                 lidCheckTimer = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] _ in
@@ -319,7 +320,7 @@ final class AppState: ObservableObject {
             lidCheckTimer?.invalidate()
             lidCheckTimer = nil
             lidLockPolicy.reset()
-            if isCurrentlyDimmed { restoreBrightness() }
+            if lidBrightnessPolicy.isDimmed { restoreBrightness() }
         }
     }
 
@@ -726,7 +727,7 @@ final class AppState: ObservableObject {
     func checkLidState() {
         guard supportsLidMonitoring else {
             lidLockPolicy.reset()
-            if isCurrentlyDimmed { restoreBrightness() }
+            if lidBrightnessPolicy.isDimmed { restoreBrightness() }
             return
         }
 
@@ -739,25 +740,27 @@ final class AppState: ObservableObject {
             MacScreenLock.lock?()
         }
         let shouldDim = supportsLidDimmer && lidDimmerEnabled && isFullySleepDisabled
-        if !shouldDim && isCurrentlyDimmed { restoreBrightness() }
+            && !lidBrightnessPolicy.restoreFailed
         // Unknown sensor data must not be interpreted as opening the lid.
         guard let isClosed = lidClosed else { return }
 
-        // The display may already report zero by the time a close event arrives.
-        // Keep the last brightness observed while the lid was open.
-        if !isClosed && !isCurrentlyDimmed { rememberOpenBrightness() }
+        if !isClosed && !lidBrightnessPolicy.isDimmed { rememberOpenBrightness() }
 
         if sleepTimerRunning && sleepTimerLidClosedOnly && !isClosed {
             sleepTimerRunning = false
         }
 
-        guard shouldDim else { return }
-
-        if isClosed && !isCurrentlyDimmed {
-            dimBrightness()
-        } else if !isClosed && isCurrentlyDimmed {
+        if isClosed {
+            if lidBrightnessPolicy.isRecovering {
+                brightnessRecoveryTimer?.invalidate()
+                brightnessRecoveryTimer = nil
+                lidBrightnessPolicy.lidClosedAgain()
+                if shouldDim { dimBrightness() }
+            } else if shouldDim && !lidBrightnessPolicy.isDimmed {
+                dimBrightness()
+            }
+        } else if lidBrightnessPolicy.isDimmed {
             restoreBrightness()
-            if !isCurrentlyDimmed { rememberOpenBrightness() }
         }
     }
 
@@ -842,30 +845,73 @@ final class AppState: ObservableObject {
     }
 
     func dimBrightness() {
-        guard supportsLidDimmer, originalBrightness != nil,
-              let display = brightnessDisplay,
+        guard supportsLidDimmer, lidBrightnessPolicy.canDim,
+              let display = lidBrightnessPolicy.savedDisplay,
               let setBrightness = DisplayBrightness.setBrightness else { return }
         guard setBrightness(display, 0.0) == 0 else { return }
-        isCurrentlyDimmed = true
+        lidBrightnessPolicy.didDim()
     }
 
     func restoreBrightness() {
-        guard isCurrentlyDimmed, let orig = originalBrightness,
-              let display = builtInDisplay() ?? brightnessDisplay,
-              let setBrightness = DisplayBrightness.setBrightness,
-              setBrightness(display, orig) == 0 else { return }
-        originalBrightness = nil
-        isCurrentlyDimmed = false
+        guard lidBrightnessPolicy.isDimmed else { return }
+        lidBrightnessPolicy.beginRecovery(at: Date())
+        guard brightnessRecoveryTimer == nil else { return }
+        let timer = Timer(timeInterval: 0.5, repeats: true) { [weak self] _ in
+            self?.checkBrightnessRecovery()
+        }
+        RunLoop.main.add(timer, forMode: .common)
+        brightnessRecoveryTimer = timer
+        checkBrightnessRecovery()
+    }
+
+    private func checkBrightnessRecovery() {
+        guard lidBrightnessPolicy.isRecovering else { return }
+        // Never take a near-zero sample as the next baseline while the panel
+        // is being reattached. Read back the actual brightness after each set.
+        guard readLidClosed() == false else { return }
+        let display = builtInDisplay()
+        var current: Float = 0
+        let read = display.flatMap { display -> Float? in
+            guard let getBrightness = DisplayBrightness.getBrightness,
+                  getBrightness(display, &current) == 0 else { return nil }
+            return current
+        }
+        switch lidBrightnessPolicy.recoveryStep(
+            readBrightness: read, displayOnline: display != nil, at: Date()
+        ) {
+        case .restore(let target):
+            if let display, let setBrightness = DisplayBrightness.setBrightness {
+                _ = setBrightness(display, target)
+            }
+        case .complete, .failed:
+            if lidBrightnessPolicy.restoreFailed {
+                NSLog("Sleep Disabler: Lid brightness restoration could not be verified; dimming is paused until brightness recovers.")
+            }
+            brightnessRecoveryTimer?.invalidate()
+            brightnessRecoveryTimer = nil
+            updateLidMonitoring()
+        case .wait:
+            break
+        }
     }
 
     private func rememberOpenBrightness() {
         guard let display = builtInDisplay(),
               let getBrightness = DisplayBrightness.getBrightness else { return }
         var current: Float = 0
-        if getBrightness(display, &current) == 0 && current.isFinite && current > 0 {
-            brightnessDisplay = display
-            originalBrightness = current
+        if getBrightness(display, &current) == 0 {
+            lidBrightnessPolicy.rememberOpenBrightness(current, display: display)
         }
+    }
+
+    func restoreBrightnessBeforeExit() {
+        brightnessRecoveryTimer?.invalidate()
+        brightnessRecoveryTimer = nil
+        guard lidBrightnessPolicy.isDimmed,
+              let target = lidBrightnessPolicy.savedBrightness,
+              let display = builtInDisplay() ?? lidBrightnessPolicy.savedDisplay,
+              let setBrightness = DisplayBrightness.setBrightness else { return }
+        _ = setBrightness(display, target)
     }
 
     private func builtInDisplay() -> CGDirectDisplayID? {
@@ -950,7 +996,7 @@ final class AppState: ObservableObject {
     }
 
     private func forceMacToSleep(failsafeGeneration: Int? = nil) {
-        if isCurrentlyDimmed { restoreBrightness() }
+        if lidBrightnessPolicy.isDimmed { restoreBrightness() }
         let needsRestore = isFullySleepDisabled
         if needsRestore { toggleSleep() }
 
@@ -1075,7 +1121,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, UNUs
     }
 
     func applicationWillTerminate(_ notification: Notification) {
-        appState?.restoreBrightness()
+        appState?.restoreBrightnessBeforeExit()
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {

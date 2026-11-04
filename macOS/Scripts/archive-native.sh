@@ -23,6 +23,7 @@ source_files=(
   "Sleep Disabler/BatteryFailsafePolicy.swift"
   "Sleep Disabler/ContentView.swift"
   "Sleep Disabler/LidLockPolicy.swift"
+  "Sleep Disabler/LidBrightnessPolicy.swift"
   "Sleep Disabler/Sleep_DisablerApp.swift"
 )
 

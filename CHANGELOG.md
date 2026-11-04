@@ -2,6 +2,17 @@
 
 Significant changes to Sleep Disabler for macOS and Linux are listed newest first. Dates follow Git author dates. Each entry identifies its commit where available; related audit-only follow-ups are grouped where noted. Version labels mark historical releases or designated milestones, not every commit. The v1.4.4 and v1.4.5 milestones are assigned retrospectively here; this does not create Git tags or change application metadata.
 
+## [2026-11-04] - macOS lid brightness recovery
+
+### Fixed
+
+- Kept the pre-close brightness throughout a 30-second reopen settling period, read the actual level back, and retried when macOS reset the display to near-zero after an earlier successful write.
+- Prevented repeated lid cycles from saving that transient low level as the next baseline. If recovery cannot be verified, paused further dimming until brightness returns to the saved level; also made quitting attempt a synchronous restore.
+
+### Changed
+
+- Added isolated repeated-cycle brightness policy checks and rebuilt separate arm64 and x86_64 native archives with Xcode Command Line Tools. Hardware lid cycling still requires attended verification.
+
 ## [2026-11-03] - macOS window and lid-dimmer repair
 
 ### Fixed

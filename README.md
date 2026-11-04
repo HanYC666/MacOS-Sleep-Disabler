@@ -25,7 +25,7 @@ Ram usage: 27.6 MB with all functions turned on.
 - Read battery percentage and the active power source through IOKit instead of parsing `pmset` text.
 - **Dynamic State Saving**: Remembers exactly what your Mac's sleep settings were before disabling sleep, and perfectly restores them when re-enabled.
 - **Battery Failsafe**: Let's you set a custom battery percentage (like 5%). If the battery drops below this while sleep is disabled, the app saves your Mac by forcing it to sleep and dropping a notification window.
-- **Lid-Closed Dimmer**: When sleep is disabled, closing a MacBook lid sets its built-in display brightness to 0. The app saves the brightness while the lid is open and restores that value when it opens again.
+- **Lid-Closed Dimmer**: When sleep is disabled, closing a MacBook lid sets its built-in display brightness to 0. The app saves the brightness while the lid is open and verifies its restoration after reopening, retrying delayed macOS resets.
 - **Lock Screen When Lid Closes (macOS)**: A saved, optional switch in the native **Lid Behavior** group and menu-bar menu locks your MacBook only while sleep prevention is active. It defaults off. The GNOME equivalent defaults on and also controls manual Suspend/sleep-key redirection; see its platform guide for details.
 - **Sleep Scheduler**: Set a days, hours, and minutes countdown to put your Mac to sleep. The last duration and its safety options are saved, and menu-bar mode provides a quick start action plus a live remaining-time display.
 
@@ -81,7 +81,7 @@ Only add a `sudoers` rule if you understand what it does. If you want to remove 
 
 ## Building from source
 
-From the repository root, run `cd macOS`, then `zsh Scripts/archive-native.sh` without `sudo`. The script uses only Xcode Command Line Tools and creates separate Apple Silicon and Intel apps. See [RELEASE.md](macOS/RELEASE.md) and [compile.md](macOS/compile.md). The isolated lid-lock policy tests run with `zsh Scripts/test-lid-lock.sh`; they cannot lock or suspend the host.
+From the repository root, run `cd macOS`, then `zsh Scripts/archive-native.sh` without `sudo`. The script uses only Xcode Command Line Tools and creates separate Apple Silicon and Intel apps. See [RELEASE.md](macOS/RELEASE.md) and [compile.md](macOS/compile.md). The isolated lid policy tests run with `zsh Scripts/test-lid-lock.sh` and `zsh Scripts/test-lid-brightness.sh`; they cannot change brightness, lock, or suspend the host.
 
 The deployment target is macOS 13.5+ by project default.
 
