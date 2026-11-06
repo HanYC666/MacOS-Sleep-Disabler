@@ -866,8 +866,8 @@ final class AppState: ObservableObject {
 
     private func checkBrightnessRecovery() {
         guard lidBrightnessPolicy.isRecovering else { return }
-        // Never take a near-zero sample as the next baseline while the panel
-        // is being reattached. Read back the actual brightness after each set.
+        // Keep the old baseline until the panel is online and a restored
+        // level is read back. Then stop recovery so manual changes stay put.
         guard readLidClosed() == false else { return }
         let display = builtInDisplay()
         var current: Float = 0

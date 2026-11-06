@@ -16,7 +16,7 @@ zsh Scripts/test-lid-brightness.sh
 zsh Scripts/archive-native.sh
 ```
 
-The test executables contain only the lid policies: they cannot change brightness, lock the screen, or suspend the computer. They check repeated lid cycles, delayed brightness resets, restore failure, and lock-transition gating. This is separate from native UI and hardware validation. The archive includes `ContentView.swift`, `LidLockPolicy.swift`, `LidBrightnessPolicy.swift`, `BatteryFailsafePolicy.swift`, and `Sleep_DisablerApp.swift`.
+The test executables contain only the lid policies: they cannot change brightness, lock the screen, or suspend the computer. They check repeated lid cycles, unverified brightness resets, manual brightness changes after verified restoration, restore failure, and lock-transition gating. This is separate from native UI and hardware validation. The archive includes `ContentView.swift`, `LidLockPolicy.swift`, `LidBrightnessPolicy.swift`, `BatteryFailsafePolicy.swift`, and `Sleep_DisablerApp.swift`.
 
 3. The script creates two independent native apps under `build/native-archives`. To install without launching, copy the matching app into Applications using Finder; quit an older copy before replacing it. To launch when ready, use only the app for your Mac:
 
@@ -35,3 +35,5 @@ The scheduled-sleep warning links Apple's `UserNotifications` framework; the arc
 Native compilation also includes `Sleep Disabler/BatteryFailsafePolicy.swift` for low-battery episode tracking and final dispatch validation. Its isolated regression checks are in `Tests/BatteryFailsafePolicyTests.swift`; compile these two files together to run the policy without invoking system power APIs.
 
 If output files already exist, pass a new directory, such as `zsh Scripts/archive-native.sh build/review`. A source update does not update previously generated apps or ZIPs. After launching a new build, the optional locking switch appears under **Lid Behavior** and in the menu-bar menu; it defaults off and operates only while sleep prevention is active. The main window is created on demand in Menu Bar mode; the dimmer captures brightness while the lid is open.
+
+The repository's arm64 and x86_64 ZIPs were rebuilt with the 2026-11-07 verified-restoration fix. Each archive contains `Sleep Disabler.app` for its own architecture. Physical lid behavior still requires an attended MacBook test.

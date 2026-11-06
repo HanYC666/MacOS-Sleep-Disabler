@@ -1,7 +1,7 @@
 import Foundation
 
-/// Keeps a pre-close brightness value until macOS has finished bringing the
-/// built-in display back online. Brightness writes alone are not confirmation.
+/// Keeps a pre-close brightness value until the built-in display is online
+/// and the restored level has been read back. Writes alone are not confirmation.
 struct LidBrightnessPolicy {
     enum RecoveryStep: Equatable {
         case wait
@@ -54,24 +54,13 @@ struct LidBrightnessPolicy {
               let deadline = recoveryDeadline else { return .wait }
         guard displayOnline else { return now >= deadline ? fail() : .wait }
 
-        if let current = readBrightness, current.isFinite, current > target + 0.08 {
-            // Do not fight a brighter manual/automatic level, but still wait
-            // out a delayed macOS reset before accepting it as a new baseline.
-            if now >= deadline {
-                finishRecovery()
-                return .complete
-            }
-            return .wait
-        }
-
         let tolerance = max(0.02, target * 0.15)
         if let current = readBrightness, current.isFinite,
            current >= target - tolerance {
-            if now >= deadline {
-                finishRecovery()
-                return .complete
-            }
-            return .wait
+            // A confirmed restore (or a brighter user-selected level) ends
+            // ownership. Later brightness changes belong to the user/macOS.
+            finishRecovery()
+            return .complete
         }
 
         return now >= deadline ? fail() : .restore(target)

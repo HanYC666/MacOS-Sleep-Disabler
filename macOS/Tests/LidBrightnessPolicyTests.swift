@@ -16,25 +16,32 @@ enum LidBrightnessPolicyTests {
         policy.didDim()
         policy.beginRecovery(at: start)
 
-        // A successful write can be followed by a delayed macOS reset. Keep
-        // the old baseline throughout the settling period and retry the reset.
-        expect(policy.recoveryStep(readBrightness: 0.55, displayOnline: true, at: start) == .wait,
-               "An immediate matching read does not finish recovery")
-        expect(policy.recoveryStep(readBrightness: 0.7, displayOnline: true,
-                                   at: start.addingTimeInterval(1)) == .wait,
-               "A brighter transient cannot finish recovery early")
+        // A zero read while the display comes online needs a restore. Once
+        // the target is read back, further user brightness changes are free.
+        expect(policy.recoveryStep(readBrightness: nil, displayOnline: false, at: start) == .wait,
+               "An offline built-in display is not treated as restored")
         policy.rememberOpenBrightness(0.02, display: 42)
         expect(policy.savedBrightness == 0.55, "A transient near-zero reading cannot poison the baseline")
         expect(policy.recoveryStep(readBrightness: 0.02, displayOnline: true,
                                    at: start.addingTimeInterval(5)) == .restore(0.55),
-               "A late brightness reset retries the original level")
-        expect(policy.recoveryStep(readBrightness: nil, displayOnline: false,
-                                   at: start.addingTimeInterval(10)) == .wait,
-               "An offline built-in display is not treated as restored")
+               "An unverified low brightness retries the original level")
         expect(policy.recoveryStep(readBrightness: 0.55, displayOnline: true,
-                                   at: start.addingTimeInterval(30)) == .complete,
-               "Recovery finishes after the settling interval")
+                                   at: start.addingTimeInterval(5.5)) == .complete,
+               "A readback of the restored level finishes recovery immediately")
         expect(!policy.isDimmed && policy.savedBrightness == nil, "Completion permits a fresh baseline")
+        expect(policy.recoveryStep(readBrightness: 0.25, displayOnline: true,
+                                   at: start.addingTimeInterval(6)) == .wait,
+               "Lowering brightness after verification never restores the old value")
+        policy.rememberOpenBrightness(0.25, display: 42)
+        expect(policy.savedBrightness == 0.25, "A manual reduction becomes the next baseline")
+
+        var brighter = LidBrightnessPolicy()
+        brighter.rememberOpenBrightness(0.4, display: 42)
+        brighter.didDim()
+        brighter.beginRecovery(at: start)
+        expect(brighter.recoveryStep(readBrightness: 0.7, displayOnline: true,
+                                    at: start) == .complete,
+               "A brighter level ends recovery without a write")
 
         policy.rememberOpenBrightness(0.4, display: 42)
         policy.didDim()
@@ -61,8 +68,8 @@ enum LidBrightnessPolicyTests {
                                          at: opened.addingTimeInterval(8)) == .restore(0.6),
                    "Rapid close/open keeps the original level")
             expect(repeated.recoveryStep(readBrightness: 0.6, displayOnline: true,
-                                         at: opened.addingTimeInterval(30)) == .complete,
-                   "Each repeated cycle recovers")
+                                         at: opened.addingTimeInterval(8.5)) == .complete,
+                   "Each repeated cycle completes after a verified restore")
         }
 
         print("Passed \(checks) lid brightness policy checks; no display brightness was changed.")

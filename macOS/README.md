@@ -21,7 +21,7 @@ Ram usage: 27.6 MB with all functions turned on.
 - Read battery percentage and the active power source through IOKit instead of parsing `pmset` text.
 - **Dynamic State Saving**: Remembers exactly what your Mac's sleep settings were before disabling sleep, and perfectly restores them when re-enabled.
 - **Battery Failsafe**: Let's you set a custom battery percentage (like 5%). If the battery drops below this while sleep is disabled, the app saves your Mac by forcing it to sleep and dropping a notification window.
-- **Lid-Closed Dimmer**: When sleep is disabled, closing a MacBook lid sets its built-in display brightness to 0. The app saves the brightness while the lid is open and restores that value when it opens again. It checks the restored level for 30 seconds because macOS can reset the display after reopening; repeated failures pause dimming until brightness recovers.
+- **Lid-Closed Dimmer**: When sleep is disabled, closing a MacBook lid sets its built-in display brightness to 0. The app saves the brightness while the lid is open and restores that value when it opens again. It retries an unverified restore for up to 30 seconds, then stops changing brightness as soon as the restored level is read back. Repeated failures pause dimming until brightness recovers.
 - **Lock Screen When Lid Closes**: Optionally lock your MacBook when you close its lid while sleep prevention is active. Find the switch under **Lid Behavior** or in the menu-bar menu. The preference is saved and starts off for existing and new installations.
 - **Sleep Scheduler**: Set a days, hours, and minutes countdown to put your Mac to sleep. The last duration and its safety options are saved, and menu-bar mode provides a quick start action plus a live remaining-time display.
 
@@ -36,6 +36,8 @@ Ram usage: 27.6 MB with all functions turned on.
 Download `Sleep-Disabler-arm64.zip` for Apple Silicon or `Sleep-Disabler-x86_64.zip` for Intel. Each archive contains a separate native `.app`; neither is a universal binary.
 
 Extract the matching archive and copy `Sleep Disabler.app` into Applications. For an upgrade, quit the existing app before replacing it, and keep its preferences so saved settings remain available. Copying an app does not launch it; open it when ready to use it. Both ZIPs include the scheduled-sleep warning, battery-failsafe repeat protection, optional lid locking, and the window and brightness fixes. Follow [compile.md](compile.md) to build from source, then copy the matching app from `build/native-archives` into Applications.
+
+Both repository ZIPs were rebuilt with the 2026-11-07 manual-brightness fix. The arm64 build was installed and launched locally; MacBook lid behavior still needs an attended hardware check.
 
 On the first launch, the app opens in Window Mode. Later launches use the saved mode. Menu Bar mode creates the main window only when you choose **Show Window** or switch to Window Mode.
 
