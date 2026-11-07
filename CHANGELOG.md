@@ -2,7 +2,7 @@
 
 Significant changes to Sleep Disabler for macOS and Linux are listed newest first. Dates follow Git author dates. Each entry identifies its commit where available; related audit-only follow-ups are grouped where noted. Version labels mark historical releases or designated milestones, not every commit. The v1.4.4 and v1.4.5 milestones are assigned retrospectively here; this does not create Git tags or change application metadata.
 
-## [2026-11-07] - macOS manual brightness after lid reopen
+## [2026-11-07] - v1.4.6 - macOS manual brightness after lid reopen
 
 ### Fixed
 
